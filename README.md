@@ -1,95 +1,151 @@
-# ESP32-S3 Personal Voice Assistant Starter
+# CYD S3 Voice Assistant (ESP32-S3 + 2.8in Touch)
 
-This is a clean Arduino sketch starter for the LCDWiki 2.8-inch ESP32-S3 display board (`ES3C28P` / `ES3N28P`).
+A personal voice assistant firmware for ESP32-S3 2.8-inch touchscreen boards (Hosyond/LILYGO/Freenove-style variants) using Arduino.
 
-## What this starter does now
+This project focuses on:
+- Touch-first local UI (listen/stop control)
+- Microphone capture and voice activity diagnostics
+- Home Assistant STT -> conversation -> TTS loop
+- On-device playback through ES8311 + I2S speaker path
 
-- Initializes the ILI9341 display using the board pin map from LCDWiki.
-- Initializes FT6336 touch over I2C.
-- Falls back to the BOOT button (`GPIO0`) if touch is unavailable.
-- Initializes ES8311 codec and captures microphone audio over I2S (16kHz, PCM16, mono).
-- Plays Home Assistant TTS WAV replies over I2S speaker output.
-- Mounts microSD via SDIO and saves each capture as WAV in `/voice/`.
-- Connects to WiFi (if configured).
-- On touch or BOOT button press, records 3 seconds of audio.
-- Hands-free mode: VAD-triggered capture with wake phrase filtering (STT-based).
-- Debug screen with live health and latency stats.
-- Optional Home Assistant backend flow:
-  - Sends audio to `POST /api/stt/{provider}`
-  - Sends transcript to `POST /api/conversation/process`
-  - Requests TTS audio URL via `POST /api/tts_get_url`
-  - Streams and plays WAV reply audio
+## Status
 
-## Hardware Pin Map (from LCDWiki)
+This repository contains active in-progress firmware and board tuning. Core voice flow is implemented, and current tuning work is aimed at improving responsiveness and audio smoothness.
 
-- LCD SPI: `CS=10, DC=46, MOSI=11, SCK=12, MISO=13, BL=45`
-- Touch I2C: `SDA=16, SCL=15, RST=18, INT=17`
-- Audio (next step): `EN=1, MCLK=4, BCLK=5, DOUT=6, LRCLK=7, DIN=8`
-- SDIO: `CLK=38, CMD=40, D0=39, D1=41, D2=48, D3=47`
+## Features
 
-## Arduino Setup
+- LVGL + TFT_eSPI UI on 320x240 ILI9341 display
+- Touch controls (FT6336) with a `Listen`/`Stop` talk button
+- Wi-Fi onboarding controls in UI (scan/save/connect)
+- 16 kHz mono PCM microphone capture via ES8311/I2S
+- RMS + peak diagnostics for speech detection visibility
+- Home Assistant integration:
+  - `POST /api/stt/{provider}`
+  - `POST /api/conversation/process`
+  - `POST /api/tts_get_url`
+  - WAV TTS streaming playback with prebuffering
+- Optional hands-free mode using VAD + phrase matching (STT-gated)
+- SD card WAV capture support for debug and validation
 
-1. Install ESP32 boards package for Arduino IDE.
-2. Select board: `ESP32S3 Dev Module`.
-3. Install libraries:
-   - `Adafruit GFX Library`
-   - `Adafruit ILI9341`
-   - `ArduinoJson`
-4. Create `secrets.h` in this folder and set credentials:
+## Repository Layout
 
-```cpp
-#pragma once
-#define WIFI_SSID "your_wifi"
-#define WIFI_PASSWORD "your_password"
-#define OPENAI_API_KEY ""
+- `voice_assistant_es3c28p.ino`: Main app/UI/state machine
+- `board_pins.h`: Board pin map used by display/touch/audio/SD
+- `i2s_mic_capture.h`: I2S capture/playback and audio-level helpers
+- `es8311_codec.h`: ES8311 control over I2C
+- `ft6336_touch.h`: FT6336 touch driver wrapper
+- `tft_espi_local_setup.h`: Local TFT_eSPI setup (avoids global edits)
+- `secrets.example.h`: Config template (copy to `secrets.h`)
+- `THIRD_PARTY_NOTICES.md`: Upstream attribution and license references
+- `LICENSE`: Project license
 
-// Optional Home Assistant backend
-#define HA_BASE_URL "http://homeassistant.local:8123"
-#define HA_ACCESS_TOKEN "long_lived_access_token"
-#define HA_STT_PROVIDER "whisper"
-#define HA_LANGUAGE "en-US"
-#define HA_AGENT_ID ""   // Optional, leave empty for default
-#define HA_TTS_ENGINE_ID "tts.piper"  // Example: tts.piper
+## Hardware Pin Map (Current Firmware)
 
-// Hands-free wake/VAD
-#define HA_WAKE_PHRASE "hey assistant"
-#define ASSISTANT_ENABLE_HANDS_FREE 1
-#define ASSISTANT_VAD_TRIGGER_RMS 0.015f
-#define ASSISTANT_VAD_TRIGGER_FRAMES 3
+From `board_pins.h`:
+
+| Function | Pins |
+|---|---|
+| TFT SPI | `CS=10`, `DC=46`, `MOSI=11`, `SCK=12`, `MISO=13`, `BL=45` |
+| Touch I2C | `SDA=16`, `SCL=15`, `RST=18`, `INT=17`, `ADDR=0x38` |
+| Audio (ES8311/I2S) | `EN=1` (active low), `MCLK=4`, `BCLK=5`, `DOUT=8`, `LRCLK=7`, `DIN=6` |
+| SDIO | `CLK=38`, `CMD=40`, `D0=39`, `D1=41`, `D2=48`, `D3=47` |
+| Misc | `BOOT=0`, `RGB=42`, `BAT_ADC=9` |
+
+Note: these boards are often sold under multiple names with small BOM/pin differences. If touch/audio is inconsistent, re-verify against your exact PCB silkscreen and vendor demo source.
+
+## Prerequisites
+
+- Arduino IDE 2.x or `arduino-cli`
+- ESP32 boards platform for Arduino
+- Libraries used by this sketch:
+  - `TFT_eSPI`
+  - `lvgl`
+  - `ArduinoJson`
+  - ESP32 core libs (`WiFi`, `HTTPClient`, `Preferences`, `SD_MMC`, etc.)
+
+## Configuration
+
+1. Copy `secrets.example.h` to `secrets.h`.
+2. Fill in Wi-Fi and Home Assistant values.
+
+Minimal required Home Assistant settings:
+- `HA_BASE_URL`
+- `HA_ACCESS_TOKEN`
+- `HA_STT_PROVIDER`
+
+Useful voice settings:
+- `HA_LANGUAGE` (default `en-US`)
+- `HA_TTS_ENGINE_ID` (for example `tts.piper`)
+- `HA_WAKE_PHRASE` (comma-separated phrases, e.g. `ok bob,hey bob`)
+
+## Build and Flash (Recommended CLI Flow)
+
+Use sequential compile then upload (do not skip compile):
+
+```powershell
+arduino-cli compile --fqbn esp32:esp32:esp32s3 \
+  --build-path .\\build .
+
+arduino-cli upload --fqbn esp32:esp32:esp32s3 \
+  --port COM10 --input-dir .\\build .
 ```
 
-5. Open `voice_assistant_es3c28p.ino` and upload.
+If your board requires custom menu options (flash size, PSRAM mode, USB CDC), append them to `--fqbn` as needed.
 
-## SD Capture Files
+## Runtime Controls
 
-- Recorded files are saved to `/voice/` on the microSD card.
-- Naming pattern: `cap_00000.wav`, `cap_00001.wav`, etc.
-- Audio format: `16kHz`, `mono`, `16-bit PCM WAV`.
+- UI `Listen` button: starts capture/assistant request
+- UI `Stop` button (same control while active): requests cancellation
+- Touch + status labels expose current assistant state and diagnostics
 
-## Controls
+## Troubleshooting
 
-- Short BOOT press: trigger one capture.
-- Long BOOT press: toggle debug screen.
-- Touch top-left corner: toggle hands-free mode on/off.
-- Touch top-right corner: toggle debug screen.
-- Touch center/anywhere else: trigger one capture.
+### No speech detected
+- Confirm mic RMS/peak values are changing during speech.
+- Validate ES8311 I2C detect and I2S pin mapping.
+- Confirm audio-enable line polarity (`EN` active-low on this board profile).
 
-## Hands-Free Notes
+### STT HTTP failures (`415`, `-3`, `connection refused`)
+- Verify Home Assistant URL and token.
+- Confirm STT provider is installed and selected.
+- Check payload format/provider expectations in Home Assistant logs.
 
-- Wake phrase detection is STT-based (cloud/back-end), not an on-device wake-word model.
-- VAD runs continuously only while idle and connected to Home Assistant.
-- If speech is detected without the wake phrase, the utterance is ignored.
+### Wake phrase does not trigger
+- Current hands-free mode is STT/VAD-gated phrase matching, not a dedicated on-device wake-word engine.
+- Validate phrase list formatting in `HA_WAKE_PHRASE`.
 
-## Touch Troubleshooting
+### TTS plays but sounds delayed/choppy
+- Check Wi-Fi quality and Home Assistant host load.
+- Adjust TTS prebuffer constants in `voice_assistant_es3c28p.ino`.
+- Verify speaker codec volume path and sample-rate conversion path.
 
-- If your module is `ES3N28P` (non-touch), use the BOOT button to trigger recording.
-- If touch does not respond on `ES3C28P`, open Serial Monitor at `115200` and confirm I2C detects `0x38` (FT6336) during boot.
-- I2C scan also typically shows `0x18` for ES8311 audio codec.
+## Repository Hygiene
 
-## Next Milestones
+To keep pushes GitHub-safe, large generated/reference artifacts are excluded:
+- `build/`
+- `diagnostics/`
+- firmware outputs (`*.bin`, `*.elf`, `*.map`, ...)
+- local secrets (`secrets.h`)
 
-1. Upgrade wake phrase from STT-based to true on-device wake-word model.
-2. Add on-screen conversation history with scrolling.
-3. Add microphone gain/settings page.
-4. Add streamed STT (partial transcript updates).
-5. Add offline fallback (local intent mode).
+If you need to keep vendor packs, store them outside this repo and reference links in docs instead of committing archives.
+
+## Citations / Sources
+
+Hardware and integration decisions were informed by these sources (accessed during project investigation):
+
+1. Freenove FNK0104 product page: https://store.freenove.com/products/fnk0104?srsltid=AfmBOoo9tLaAnFIvsDp7I6YYGcHCNwwpFuMkk1zbFsszZ0aVWed3Zb_m
+2. Freenove ESP32-S3 display docs: https://docs.freenove.com/projects/fnk0104/en/latest/fnk0104/codes/MAIN/Freenove_ESP32S3_Display.html
+3. Freenove Media Kit / voice examples: https://docs.freenove.com/projects/fnk0102/en/latest/fnk0102/codes/Main/Preface.html
+4. Freenove board repository: https://github.com/Freenove/Freenove_ESP32_S3_WROOM_Board
+5. Waveshare ESP32-S3 Touch LCD 2.8 wiki: https://www.waveshare.com/wiki/ESP32-S3-Touch-LCD-2.8
+6. Waveshare ESP32-S3 Touch LCD 2.8-C wiki: https://www.waveshare.com/wiki/ESP32-S3-Touch-LCD-2.8-C
+7. CYD projects reference collection: https://github.com/bitbank2/CYD_Projects
+8. ESP32 SmartDisplay reference code: https://github.com/rzeldent/esp32-smartdisplay
+9. Home Assistant community troubleshooting thread: https://community.home-assistant.io/t/mostly-working-config-for-cheap-18-2-8-esp32-s3-touchscreen-with-speaker-and-mic/965950
+10. Home Assistant wake-word troubleshooting thread: https://community.home-assistant.io/t/solved-micro-wake-word-not-working-on-esp32-s3-e-g-seed-studio-xiao-sense-esp32-s3-sense/873638
+11. ESP32-2432S028 spec mirror PDF: https://github.com/witnessmenow/ESP32-Cheap-Yellow-Display/blob/main/OriginalDocumentation/2-Specification/ESP32-2432S028%20Specifications-EN.pdf
+
+## Licensing
+
+- This project is licensed under the MIT License. See [LICENSE](LICENSE).
+- Third-party components, libraries, and documentation remain under their respective licenses/terms. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

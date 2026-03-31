@@ -1,1 +1,31 @@
+# Local secrets
 secrets.h
+
+# Arduino/ESP32 build outputs
+build/
+build_opt.h
+*.bin
+*.elf
+*.map
+*.hex
+*.uf2
+*.tmp
+*.o
+*.d
+*.a
+*.lst
+
+# Downloaded vendor/reference packs (kept outside git)
+diagnostics/
+downloads/
+*.zip
+*.7z
+*.rar
+
+# Serial/debug logs
+*.log
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+*.swp

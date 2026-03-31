@@ -41,7 +41,7 @@
 #endif
 
 #ifndef HA_WAKE_PHRASE
-#define HA_WAKE_PHRASE "hey assistant"
+#define HA_WAKE_PHRASE "ok bob,okay bob,hey bob"
 #endif
 
 #ifndef ASSISTANT_ENABLE_HANDS_FREE

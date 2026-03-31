@@ -10,7 +10,9 @@
 #define USER_SETUP_INFO "LCDWiki_2p8_ESP32S3_ILI9341_Local"
 
 #define ILI9341_DRIVER
-#define USE_HSPI_PORT
+// Explicitly bind to FSPI host on ESP32-S3.
+// Leaving this implicit can map to an invalid host on some core/library combos.
+#define USE_FSPI_PORT
 
 #define TFT_CS   10
 #define TFT_DC   46

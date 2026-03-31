@@ -16,75 +16,46 @@ class Es8311Codec {
       return false;
     }
 
-    // Based on the ES8311 init pattern used in Espressif's ADF driver.
-    // This config sets ES8311 as I2S slave and enables ADC capture.
-    return writeReg(0x44, 0x08) &&
-           writeReg(0x44, 0x08) &&
-           writeReg(0x01, 0x30) &&
-           writeReg(0x02, 0x00) &&
-           writeReg(0x03, 0x10) &&
-           writeReg(0x16, 0x24) &&
-           writeReg(0x04, 0x10) &&
-           writeReg(0x05, 0x00) &&
-           writeReg(0x0B, 0x00) &&
-           writeReg(0x0C, 0x00) &&
-           writeReg(0x10, 0x1F) &&
-           writeReg(0x11, 0x7F) &&
-           writeReg(0x00, 0x80) &&
-           writeReg(0x00, 0x80) &&
-           writeReg(0x01, 0x3F) &&
-           writeReg(0x02, 0x00) &&
-           writeReg(0x03, 0x10) &&
-           writeReg(0x04, 0x20) &&
-           writeReg(0x05, 0x00) &&
-           writeReg(0x06, 0x03) &&
-           writeReg(0x07, 0x00) &&
-           writeReg(0x08, 0xFF) &&
-           writeReg(0x09, 0x4C) &&
-           writeReg(0x0A, 0x0C) &&
-           writeReg(0x13, 0x10) &&
-           writeReg(0x1B, 0x0A) &&
-           writeReg(0x1C, 0x6A) &&
-           writeReg(0x17, 0xBF) &&
-           writeReg(0x0E, 0x02) &&
-           writeReg(0x12, 0x00) &&
-           writeReg(0x14, 0x1A) &&
-           writeReg(0x0D, 0x01) &&
-           writeReg(0x15, 0x40) &&
-           writeReg(0x37, 0x08) &&
+    // Follow the Hosyond/Freenove ES3C28P Example_30_ai_chat init flow:
+    // ES8311 in slave I2S mode, 16 kHz, MCLK=6.144 MHz, analog mic enabled.
+    if (!writeReg(0x00, 0x1F)) {  // full reset
+      return false;
+    }
+    delay(20);
+
+    return writeReg(0x00, 0x00) &&
+           writeReg(0x00, 0x80) &&  // power on
+           writeReg(0x01, 0x3F) &&  // enable all clocks
+           writeReg(0x02, 0x48) &&  // pre_div=3, pre_multi=2x
+           writeReg(0x03, 0x10) &&  // adc osr
+           writeReg(0x04, 0x10) &&  // dac osr
+           writeReg(0x05, 0x00) &&  // adc/dac div
+           writeReg(0x06, 0x03) &&  // bclk div
+           writeReg(0x07, 0x00) &&  // lrck high byte
+           writeReg(0x08, 0xFF) &&  // lrck low byte
+           writeReg(0x09, 0x0C) &&  // I2S in, 16-bit
+           writeReg(0x0A, 0x0C) &&  // I2S out, 16-bit
+           writeReg(0x0D, 0x01) &&  // analog power up
+           writeReg(0x0E, 0x02) &&  // ADC/PGA power up
+           writeReg(0x12, 0x00) &&  // DAC power up
+           writeReg(0x13, 0x10) &&  // HP output enable
+           writeReg(0x31, 0x00) &&  // DAC unmute
+           writeReg(0x32, 0xD0) &&  // DAC volume (higher output)
+           writeReg(0x17, 0xC8) &&  // ADC digital gain
+           writeReg(0x1C, 0x6A) &&  // ADC EQ bypass + DC cancel
+           writeReg(0x37, 0x08) &&  // DAC EQ bypass
+           writeReg(0x44, 0x00) &&  // disable loopback/test path
            writeReg(0x45, 0x00) &&
-           writeReg(0x44, 0x58);
+           writeReg(0x14, 0x1A);    // analog MIC + max PGA
   }
 
   // Gain values map to ES8311 register 0x16.
   bool setMicGainDb(uint8_t gainDb) {
     uint8_t regValue = 0x00;
-    switch (gainDb) {
-      case 0:
-        regValue = 0x10;
-        break;
-      case 6:
-        regValue = 0x12;
-        break;
-      case 12:
-        regValue = 0x14;
-        break;
-      case 18:
-        regValue = 0x16;
-        break;
-      case 24:
-        regValue = 0x18;
-        break;
-      case 30:
-        regValue = 0x1A;
-        break;
-      case 36:
-        regValue = 0x1C;
-        break;
-      case 42:
-      default:
-        regValue = 0x1E;
-        break;
+    if (gainDb >= 42) {
+      regValue = 0x07;
+    } else {
+      regValue = gainDb / 6;  // 0..7 => 0 dB .. 42 dB
     }
     return writeReg(0x16, regValue);
   }

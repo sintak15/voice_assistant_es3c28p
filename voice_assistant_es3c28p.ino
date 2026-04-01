@@ -89,11 +89,12 @@ static const uint16_t TAB_INDEX_HOME = 0;
 static const uint16_t TAB_INDEX_SETTINGS = 1;
 static const uint16_t TAB_INDEX_WIFI = 2;
 static const uint16_t TAB_INDEX_PERFORMANCE = 3;
-static const uint16_t TAB_INDEX_NOTES = 4;
-static const uint16_t TAB_INDEX_POCKET_PET = 5;
-static const uint16_t TAB_INDEX_CALENDAR = 6;
-static const uint16_t TAB_INDEX_SYNC_TASKS = 7;
-static const uint16_t TAB_COUNT = 8;
+static const uint16_t TAB_INDEX_DISPLAY = 4;
+static const uint16_t TAB_INDEX_NOTES = 5;
+static const uint16_t TAB_INDEX_POCKET_PET = 6;
+static const uint16_t TAB_INDEX_CALENDAR = 7;
+static const uint16_t TAB_INDEX_SYNC_TASKS = 8;
+static const uint16_t TAB_COUNT = 9;
 static const size_t MAX_CALENDAR_EVENTS = 20;
 static const size_t MAX_SYNC_TASKS = 24;
 static const uint16_t CALENDAR_ALERT_LEAD_MINUTES = 10;
@@ -110,6 +111,13 @@ static const size_t TTS_ASYNC_CHUNK_SAMPLES = 512;
 static const BaseType_t TTS_ASYNC_CORE = 0;
 static const uint32_t TTS_ASYNC_PUSH_TIMEOUT_MS = 3000;
 static const uint32_t PERF_REFRESH_INTERVAL_MS = 1000;
+static const uint8_t BACKLIGHT_MIN_PERCENT = 20;
+static const uint8_t BACKLIGHT_MAX_PERCENT = 100;
+static const uint8_t BACKLIGHT_PRESET_LOW = 35;
+static const uint8_t BACKLIGHT_PRESET_MED = 65;
+static const uint8_t BACKLIGHT_PRESET_HIGH = 100;
+static const uint32_t BACKLIGHT_PWM_FREQ_HZ = 22000;
+static const uint8_t BACKLIGHT_PWM_BITS = 10;
 
 #ifndef CLOUD_CALENDAR_EVENTS_URL
 #define CLOUD_CALENDAR_EVENTS_URL ""
@@ -272,6 +280,11 @@ lv_obj_t* uiLabelSyncTasksStatus = nullptr;
 lv_obj_t* uiDdTodoEntity = nullptr;
 lv_obj_t* uiTaPerformance = nullptr;
 lv_obj_t* uiLabelPerfStatus = nullptr;
+lv_obj_t* uiSliderBacklight = nullptr;
+lv_obj_t* uiLabelBacklightValue = nullptr;
+
+bool backlightPwmReady = false;
+uint8_t backlightPercent = BACKLIGHT_PRESET_HIGH;
 
 String notesText;
 
@@ -498,8 +511,13 @@ void uiOpenNotesButtonEventCb(lv_event_t* e);
 void uiOpenSettingsButtonEventCb(lv_event_t* e);
 void uiOpenWifiMenuButtonEventCb(lv_event_t* e);
 void uiOpenPerformanceButtonEventCb(lv_event_t* e);
+void uiOpenDisplayMenuButtonEventCb(lv_event_t* e);
 void uiSettingsSyncButtonEventCb(lv_event_t* e);
 void uiCalibrateMicButtonEventCb(lv_event_t* e);
+void uiBacklightSliderEventCb(lv_event_t* e);
+void uiBacklightPresetLowEventCb(lv_event_t* e);
+void uiBacklightPresetMedEventCb(lv_event_t* e);
+void uiBacklightPresetHighEventCb(lv_event_t* e);
 void uiOpenPocketPetButtonEventCb(lv_event_t* e);
 void uiOpenCalendarButtonEventCb(lv_event_t* e);
 void uiOpenSyncTasksButtonEventCb(lv_event_t* e);
@@ -515,6 +533,12 @@ void uiPocketPetCleanButtonEventCb(lv_event_t* e);
 void uiPocketPetSleepButtonEventCb(lv_event_t* e);
 void uiPocketPetHealButtonEventCb(lv_event_t* e);
 void uiPocketPetResetButtonEventCb(lv_event_t* e);
+void applyBacklightPercent(uint8_t percent, bool persist);
+void refreshBacklightUi();
+
+static bool isTapLikeEvent(lv_event_code_t code) {
+  return code == LV_EVENT_CLICKED || code == LV_EVENT_RELEASED;
+}
 
 void setState(AssistantState nextState, const String& detail) {
   state = nextState;
@@ -671,6 +695,53 @@ static uint8_t clampPercentInt(int value) {
     return 100;
   }
   return static_cast<uint8_t>(value);
+}
+
+static uint8_t clampBacklightPercent(int value) {
+  if (value < static_cast<int>(BACKLIGHT_MIN_PERCENT)) {
+    return BACKLIGHT_MIN_PERCENT;
+  }
+  if (value > static_cast<int>(BACKLIGHT_MAX_PERCENT)) {
+    return BACKLIGHT_MAX_PERCENT;
+  }
+  return static_cast<uint8_t>(value);
+}
+
+static uint32_t backlightDutyFromPercent(uint8_t percent) {
+  const uint8_t bounded = clampBacklightPercent(percent);
+  const uint32_t maxDuty = (1UL << BACKLIGHT_PWM_BITS) - 1UL;
+  return (static_cast<uint32_t>(bounded) * maxDuty) / 100UL;
+}
+
+void refreshBacklightUi() {
+  if (uiSliderBacklight) {
+    if (lv_slider_get_value(uiSliderBacklight) != static_cast<int>(backlightPercent)) {
+      lv_slider_set_value(uiSliderBacklight, backlightPercent, LV_ANIM_OFF);
+    }
+  }
+  if (uiLabelBacklightValue) {
+    String text = String("Brightness: ") + String(backlightPercent) + "%";
+    if (!backlightPwmReady) {
+      text += " (fixed)";
+    }
+    lv_label_set_text(uiLabelBacklightValue, text.c_str());
+  }
+}
+
+void applyBacklightPercent(uint8_t percent, bool persist) {
+  backlightPercent = clampBacklightPercent(percent);
+  if (backlightPwmReady) {
+    ledcWrite(PIN_TFT_BL, backlightDutyFromPercent(backlightPercent));
+  } else {
+    digitalWrite(PIN_TFT_BL, HIGH);
+  }
+  if (persist) {
+    Preferences prefs;
+    prefs.begin("voice_cfg", false);
+    prefs.putUChar("bl_pct", backlightPercent);
+    prefs.end();
+  }
+  refreshBacklightUi();
 }
 
 const char* pocketPetModeName(PocketPetMode mode) {
@@ -1118,6 +1189,7 @@ void loadWifiConfig() {
   configuredPassword = prefs.getString("wifi_pwd", WIFI_PASSWORD);
   String todoDefault = strlen(HA_TODO_ENTITY_ID) > 0 ? String(HA_TODO_ENTITY_ID) : String("todo.to_do_list");
   configuredTodoEntity = prefs.getString("ha_todo_entity", todoDefault);
+  backlightPercent = clampBacklightPercent(static_cast<int>(prefs.getUChar("bl_pct", BACKLIGHT_PRESET_HIGH)));
   prefs.end();
 }
 
@@ -5064,7 +5136,7 @@ void uiClearNotesButtonEventCb(lv_event_t* e) {
 }
 
 void uiOpenNotesButtonEventCb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+  if (!isTapLikeEvent(lv_event_get_code(e))) {
     return;
   }
   if (uiTabview) {
@@ -5073,7 +5145,7 @@ void uiOpenNotesButtonEventCb(lv_event_t* e) {
 }
 
 void uiOpenSettingsButtonEventCb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+  if (!isTapLikeEvent(lv_event_get_code(e))) {
     return;
   }
   if (uiTabview) {
@@ -5082,7 +5154,7 @@ void uiOpenSettingsButtonEventCb(lv_event_t* e) {
 }
 
 void uiOpenWifiMenuButtonEventCb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+  if (!isTapLikeEvent(lv_event_get_code(e))) {
     return;
   }
   if (uiTabview) {
@@ -5091,7 +5163,7 @@ void uiOpenWifiMenuButtonEventCb(lv_event_t* e) {
 }
 
 void uiOpenPerformanceButtonEventCb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+  if (!isTapLikeEvent(lv_event_get_code(e))) {
     return;
   }
   if (uiTabview) {
@@ -5100,8 +5172,17 @@ void uiOpenPerformanceButtonEventCb(lv_event_t* e) {
   uiRefreshPerformanceMetrics();
 }
 
+void uiOpenDisplayMenuButtonEventCb(lv_event_t* e) {
+  if (!isTapLikeEvent(lv_event_get_code(e))) {
+    return;
+  }
+  if (uiTabview) {
+    lv_tabview_set_act(uiTabview, TAB_INDEX_DISPLAY, LV_ANIM_OFF);
+  }
+}
+
 void uiSettingsSyncButtonEventCb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+  if (!isTapLikeEvent(lv_event_get_code(e))) {
     return;
   }
   cloudSyncRequested = true;
@@ -5110,7 +5191,7 @@ void uiSettingsSyncButtonEventCb(lv_event_t* e) {
 }
 
 void uiCalibrateMicButtonEventCb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+  if (!isTapLikeEvent(lv_event_get_code(e))) {
     return;
   }
   if (micMuted) {
@@ -5129,8 +5210,37 @@ void uiCalibrateMicButtonEventCb(lv_event_t* e) {
   uiRefreshPerformanceMetrics();
 }
 
+void uiBacklightSliderEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED || !uiSliderBacklight) {
+    return;
+  }
+  const int value = lv_slider_get_value(uiSliderBacklight);
+  applyBacklightPercent(static_cast<uint8_t>(value), true);
+}
+
+void uiBacklightPresetLowEventCb(lv_event_t* e) {
+  if (!isTapLikeEvent(lv_event_get_code(e))) {
+    return;
+  }
+  applyBacklightPercent(BACKLIGHT_PRESET_LOW, true);
+}
+
+void uiBacklightPresetMedEventCb(lv_event_t* e) {
+  if (!isTapLikeEvent(lv_event_get_code(e))) {
+    return;
+  }
+  applyBacklightPercent(BACKLIGHT_PRESET_MED, true);
+}
+
+void uiBacklightPresetHighEventCb(lv_event_t* e) {
+  if (!isTapLikeEvent(lv_event_get_code(e))) {
+    return;
+  }
+  applyBacklightPercent(BACKLIGHT_PRESET_HIGH, true);
+}
+
 void uiOpenPocketPetButtonEventCb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+  if (!isTapLikeEvent(lv_event_get_code(e))) {
     return;
   }
   if (uiTabview) {
@@ -5139,7 +5249,7 @@ void uiOpenPocketPetButtonEventCb(lv_event_t* e) {
 }
 
 void uiOpenCalendarButtonEventCb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+  if (!isTapLikeEvent(lv_event_get_code(e))) {
     return;
   }
   if (uiTabview) {
@@ -5148,7 +5258,7 @@ void uiOpenCalendarButtonEventCb(lv_event_t* e) {
 }
 
 void uiOpenSyncTasksButtonEventCb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+  if (!isTapLikeEvent(lv_event_get_code(e))) {
     return;
   }
   if (uiTabview) {
@@ -5166,7 +5276,7 @@ void uiCloudSyncButtonEventCb(lv_event_t* e) {
 }
 
 void uiNavHomeButtonEventCb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !uiTabview) {
+  if (!isTapLikeEvent(lv_event_get_code(e)) || !uiTabview) {
     return;
   }
   navIgnoreTabChange = true;
@@ -5176,7 +5286,7 @@ void uiNavHomeButtonEventCb(lv_event_t* e) {
 }
 
 void uiNavBackButtonEventCb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !uiTabview) {
+  if (!isTapLikeEvent(lv_event_get_code(e)) || !uiTabview) {
     return;
   }
   if (navHistoryCount > 0) {
@@ -5513,6 +5623,7 @@ void buildUi() {
   lv_obj_t* tabSettings = lv_tabview_add_tab(uiTabview, "Settings");
   lv_obj_t* tabWifi = lv_tabview_add_tab(uiTabview, "Wi-Fi");
   lv_obj_t* tabPerformance = lv_tabview_add_tab(uiTabview, "Performance");
+  lv_obj_t* tabDisplay = lv_tabview_add_tab(uiTabview, "Display");
   lv_obj_t* tabNotes = lv_tabview_add_tab(uiTabview, "Notes");
   lv_obj_t* tabPocketPet = lv_tabview_add_tab(uiTabview, "Pocket Pet");
   lv_obj_t* tabCalendar = lv_tabview_add_tab(uiTabview, "Calendar");
@@ -5522,6 +5633,7 @@ void buildUi() {
   lv_obj_set_scrollbar_mode(tabSettings, LV_SCROLLBAR_MODE_OFF);
   lv_obj_set_scrollbar_mode(tabWifi, LV_SCROLLBAR_MODE_OFF);
   lv_obj_set_scrollbar_mode(tabPerformance, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_scrollbar_mode(tabDisplay, LV_SCROLLBAR_MODE_OFF);
   lv_obj_set_scrollbar_mode(tabNotes, LV_SCROLLBAR_MODE_OFF);
   lv_obj_set_scrollbar_mode(tabPocketPet, LV_SCROLLBAR_MODE_OFF);
   lv_obj_set_scrollbar_mode(tabCalendar, LV_SCROLLBAR_MODE_OFF);
@@ -5530,6 +5642,7 @@ void buildUi() {
   lv_obj_set_style_pad_all(tabSettings, 0, LV_PART_MAIN);
   lv_obj_set_style_pad_all(tabWifi, 0, LV_PART_MAIN);
   lv_obj_set_style_pad_all(tabPerformance, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(tabDisplay, 0, LV_PART_MAIN);
   lv_obj_set_style_pad_all(tabNotes, 0, LV_PART_MAIN);
   lv_obj_set_style_pad_all(tabPocketPet, 0, LV_PART_MAIN);
   lv_obj_set_style_pad_all(tabCalendar, 0, LV_PART_MAIN);
@@ -5542,6 +5655,8 @@ void buildUi() {
   lv_obj_set_style_bg_opa(tabWifi, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_bg_color(tabPerformance, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(tabPerformance, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(tabDisplay, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(tabDisplay, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_bg_color(tabNotes, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(tabNotes, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_bg_color(tabPocketPet, lv_color_hex(0x000000), LV_PART_MAIN);
@@ -5598,6 +5713,7 @@ void buildUi() {
   addStandardNav(tabSettings, "Settings");
   addStandardNav(tabWifi, "Wi-Fi");
   addStandardNav(tabPerformance, "Performance");
+  addStandardNav(tabDisplay, "Display");
   addStandardNav(tabNotes, "Notes");
   addStandardNav(tabPocketPet, "Pocket Pet");
   addStandardNav(tabCalendar, "Calendar");
@@ -5798,51 +5914,82 @@ void buildUi() {
   lv_obj_set_width(settingsHint, SCREEN_WIDTH - 16);
   lv_obj_align(settingsHint, LV_ALIGN_TOP_LEFT, 8, 56);
   lv_label_set_long_mode(settingsHint, LV_LABEL_LONG_WRAP);
-  lv_label_set_text(settingsHint, "Manage Wi-Fi, sync, performance, and mic calibration.");
+  lv_label_set_text(settingsHint, "Manage Wi-Fi, display, sync, performance, and mic calibration.");
   lv_obj_set_style_text_color(settingsHint, lv_color_hex(0x9FB3CF), LV_PART_MAIN);
 
   lv_obj_t* settingsWifiBtn = lv_btn_create(tabSettings);
-  lv_obj_set_size(settingsWifiBtn, SCREEN_WIDTH - 16, 40);
+  lv_obj_set_size(settingsWifiBtn, SCREEN_WIDTH - 16, 32);
   lv_obj_align(settingsWifiBtn, LV_ALIGN_TOP_LEFT, 8, 88);
   lv_obj_set_style_radius(settingsWifiBtn, 10, LV_PART_MAIN);
   lv_obj_set_style_bg_color(settingsWifiBtn, lv_color_hex(0x1D4ED8), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(settingsWifiBtn, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(settingsWifiBtn, 1, LV_PART_MAIN);
+  lv_obj_set_style_border_color(settingsWifiBtn, lv_color_hex(0x60A5FA), LV_PART_MAIN);
+  lv_obj_set_style_text_color(settingsWifiBtn, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
   lv_obj_add_event_cb(settingsWifiBtn, uiOpenWifiMenuButtonEventCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* settingsWifiLabel = lv_label_create(settingsWifiBtn);
   lv_label_set_text(settingsWifiLabel, LV_SYMBOL_WIFI "  Wi-Fi");
+  lv_obj_set_style_text_color(settingsWifiLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
   lv_obj_center(settingsWifiLabel);
 
   lv_obj_t* settingsPerfBtn = lv_btn_create(tabSettings);
-  lv_obj_set_size(settingsPerfBtn, SCREEN_WIDTH - 16, 40);
-  lv_obj_align(settingsPerfBtn, LV_ALIGN_TOP_LEFT, 8, 132);
+  lv_obj_set_size(settingsPerfBtn, SCREEN_WIDTH - 16, 32);
+  lv_obj_align(settingsPerfBtn, LV_ALIGN_TOP_LEFT, 8, 126);
   lv_obj_set_style_radius(settingsPerfBtn, 10, LV_PART_MAIN);
   lv_obj_set_style_bg_color(settingsPerfBtn, lv_color_hex(0x7C3AED), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(settingsPerfBtn, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(settingsPerfBtn, 1, LV_PART_MAIN);
+  lv_obj_set_style_border_color(settingsPerfBtn, lv_color_hex(0xA78BFA), LV_PART_MAIN);
+  lv_obj_set_style_text_color(settingsPerfBtn, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
   lv_obj_add_event_cb(settingsPerfBtn, uiOpenPerformanceButtonEventCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* settingsPerfLabel = lv_label_create(settingsPerfBtn);
   lv_label_set_text(settingsPerfLabel, LV_SYMBOL_DRIVE "  Performance");
+  lv_obj_set_style_text_color(settingsPerfLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
   lv_obj_center(settingsPerfLabel);
 
+  lv_obj_t* settingsDisplayBtn = lv_btn_create(tabSettings);
+  lv_obj_set_size(settingsDisplayBtn, SCREEN_WIDTH - 16, 32);
+  lv_obj_align(settingsDisplayBtn, LV_ALIGN_TOP_LEFT, 8, 164);
+  lv_obj_set_style_radius(settingsDisplayBtn, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(settingsDisplayBtn, lv_color_hex(0x0E7490), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(settingsDisplayBtn, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(settingsDisplayBtn, 1, LV_PART_MAIN);
+  lv_obj_set_style_border_color(settingsDisplayBtn, lv_color_hex(0x67E8F9), LV_PART_MAIN);
+  lv_obj_set_style_text_color(settingsDisplayBtn, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+  lv_obj_add_event_cb(settingsDisplayBtn, uiOpenDisplayMenuButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* settingsDisplayLabel = lv_label_create(settingsDisplayBtn);
+  lv_label_set_text(settingsDisplayLabel, LV_SYMBOL_EYE_OPEN "  Display / Backlight");
+  lv_obj_set_style_text_color(settingsDisplayLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+  lv_obj_center(settingsDisplayLabel);
+
   lv_obj_t* settingsSyncBtn = lv_btn_create(tabSettings);
-  lv_obj_set_size(settingsSyncBtn, SCREEN_WIDTH - 16, 40);
-  lv_obj_align(settingsSyncBtn, LV_ALIGN_TOP_LEFT, 8, 176);
+  lv_obj_set_size(settingsSyncBtn, SCREEN_WIDTH - 16, 32);
+  lv_obj_align(settingsSyncBtn, LV_ALIGN_TOP_LEFT, 8, 202);
   lv_obj_set_style_radius(settingsSyncBtn, 10, LV_PART_MAIN);
   lv_obj_set_style_bg_color(settingsSyncBtn, lv_color_hex(0x15803D), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(settingsSyncBtn, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(settingsSyncBtn, 1, LV_PART_MAIN);
+  lv_obj_set_style_border_color(settingsSyncBtn, lv_color_hex(0x4ADE80), LV_PART_MAIN);
+  lv_obj_set_style_text_color(settingsSyncBtn, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
   lv_obj_add_event_cb(settingsSyncBtn, uiSettingsSyncButtonEventCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* settingsSyncLabel = lv_label_create(settingsSyncBtn);
   lv_label_set_text(settingsSyncLabel, LV_SYMBOL_REFRESH "  Sync Now");
+  lv_obj_set_style_text_color(settingsSyncLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
   lv_obj_center(settingsSyncLabel);
 
   lv_obj_t* settingsCalBtn = lv_btn_create(tabSettings);
-  lv_obj_set_size(settingsCalBtn, SCREEN_WIDTH - 16, 40);
-  lv_obj_align(settingsCalBtn, LV_ALIGN_TOP_LEFT, 8, 220);
+  lv_obj_set_size(settingsCalBtn, SCREEN_WIDTH - 16, 32);
+  lv_obj_align(settingsCalBtn, LV_ALIGN_TOP_LEFT, 8, 240);
   lv_obj_set_style_radius(settingsCalBtn, 10, LV_PART_MAIN);
   lv_obj_set_style_bg_color(settingsCalBtn, lv_color_hex(0x0F766E), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(settingsCalBtn, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(settingsCalBtn, 1, LV_PART_MAIN);
+  lv_obj_set_style_border_color(settingsCalBtn, lv_color_hex(0x5EEAD4), LV_PART_MAIN);
+  lv_obj_set_style_text_color(settingsCalBtn, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
   lv_obj_add_event_cb(settingsCalBtn, uiCalibrateMicButtonEventCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* settingsCalLabel = lv_label_create(settingsCalBtn);
   lv_label_set_text(settingsCalLabel, LV_SYMBOL_AUDIO "  Calibrate Mic");
+  lv_obj_set_style_text_color(settingsCalLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
   lv_obj_center(settingsCalLabel);
 
   lv_obj_t* labelSsid = lv_label_create(tabWifi);
@@ -5952,6 +6099,66 @@ void buildUi() {
   lv_label_set_long_mode(uiLabelPerfStatus, LV_LABEL_LONG_DOT);
   lv_label_set_text(uiLabelPerfStatus, "Waiting for first sample");
   lv_obj_set_style_text_color(uiLabelPerfStatus, lv_color_hex(0x9FB3CF), LV_PART_MAIN);
+
+  lv_obj_t* displayTitle = lv_label_create(tabDisplay);
+  lv_obj_align(displayTitle, LV_ALIGN_TOP_LEFT, 8, 36);
+  lv_label_set_text(displayTitle, "Display / Backlight");
+  lv_obj_set_style_text_color(displayTitle, lv_color_hex(0x7DD3FC), LV_PART_MAIN);
+
+  lv_obj_t* displayHint = lv_label_create(tabDisplay);
+  lv_obj_set_width(displayHint, SCREEN_WIDTH - 16);
+  lv_obj_align(displayHint, LV_ALIGN_TOP_LEFT, 8, 56);
+  lv_label_set_long_mode(displayHint, LV_LABEL_LONG_WRAP);
+  lv_label_set_text(displayHint, "Adjust screen brightness and save it for next boot.");
+  lv_obj_set_style_text_color(displayHint, lv_color_hex(0x9FB3CF), LV_PART_MAIN);
+
+  uiLabelBacklightValue = lv_label_create(tabDisplay);
+  lv_obj_align(uiLabelBacklightValue, LV_ALIGN_TOP_LEFT, 8, 90);
+  lv_label_set_text(uiLabelBacklightValue, "Brightness: 100%");
+  lv_obj_set_style_text_color(uiLabelBacklightValue, lv_color_hex(0xEAF2FF), LV_PART_MAIN);
+
+  uiSliderBacklight = lv_slider_create(tabDisplay);
+  lv_obj_set_size(uiSliderBacklight, SCREEN_WIDTH - 16, 16);
+  lv_obj_align(uiSliderBacklight, LV_ALIGN_TOP_LEFT, 8, 112);
+  lv_slider_set_range(uiSliderBacklight, BACKLIGHT_MIN_PERCENT, BACKLIGHT_MAX_PERCENT);
+  lv_slider_set_value(uiSliderBacklight, backlightPercent, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(uiSliderBacklight, lv_color_hex(0x10233C), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiSliderBacklight, lv_color_hex(0x38BDF8), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(uiSliderBacklight, lv_color_hex(0xEAF2FF), LV_PART_KNOB);
+  lv_obj_add_event_cb(uiSliderBacklight, uiBacklightSliderEventCb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  lv_obj_t* backlightLowBtn = lv_btn_create(tabDisplay);
+  lv_obj_set_size(backlightLowBtn, 68, 32);
+  lv_obj_align(backlightLowBtn, LV_ALIGN_TOP_LEFT, 8, 142);
+  lv_obj_set_style_radius(backlightLowBtn, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(backlightLowBtn, lv_color_hex(0x334155), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(backlightLowBtn, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_event_cb(backlightLowBtn, uiBacklightPresetLowEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* backlightLowLabel = lv_label_create(backlightLowBtn);
+  lv_label_set_text(backlightLowLabel, "Low");
+  lv_obj_center(backlightLowLabel);
+
+  lv_obj_t* backlightMedBtn = lv_btn_create(tabDisplay);
+  lv_obj_set_size(backlightMedBtn, 68, 32);
+  lv_obj_align(backlightMedBtn, LV_ALIGN_TOP_MID, 0, 142);
+  lv_obj_set_style_radius(backlightMedBtn, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(backlightMedBtn, lv_color_hex(0x1D4ED8), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(backlightMedBtn, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_event_cb(backlightMedBtn, uiBacklightPresetMedEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* backlightMedLabel = lv_label_create(backlightMedBtn);
+  lv_label_set_text(backlightMedLabel, "Med");
+  lv_obj_center(backlightMedLabel);
+
+  lv_obj_t* backlightHighBtn = lv_btn_create(tabDisplay);
+  lv_obj_set_size(backlightHighBtn, 68, 32);
+  lv_obj_align(backlightHighBtn, LV_ALIGN_TOP_RIGHT, -8, 142);
+  lv_obj_set_style_radius(backlightHighBtn, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(backlightHighBtn, lv_color_hex(0x0F766E), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(backlightHighBtn, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_event_cb(backlightHighBtn, uiBacklightPresetHighEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* backlightHighLabel = lv_label_create(backlightHighBtn);
+  lv_label_set_text(backlightHighLabel, "High");
+  lv_obj_center(backlightHighLabel);
 
   lv_obj_t* notesTitle = lv_label_create(tabNotes);
   lv_obj_align(notesTitle, LV_ALIGN_TOP_LEFT, 8, 36);
@@ -6280,6 +6487,7 @@ void buildUi() {
   uiRefreshCalendarList();
   uiRefreshSyncTasksList();
   uiRefreshPerformanceMetrics();
+  refreshBacklightUi();
   uiUpdatePocketPet();
 }
 
@@ -6699,6 +6907,11 @@ void setup() {
   lv_indev_drv_register(&indevDrv);
 
   loadWifiConfig();
+  backlightPwmReady = ledcAttach(PIN_TFT_BL, BACKLIGHT_PWM_FREQ_HZ, BACKLIGHT_PWM_BITS);
+  if (!backlightPwmReady) {
+    Serial.println("[BL] pwm attach failed; using fixed backlight");
+  }
+  applyBacklightPercent(backlightPercent, false);
   loadPocketPetState();
   buildUi();
 

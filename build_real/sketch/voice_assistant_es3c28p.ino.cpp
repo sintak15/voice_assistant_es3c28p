@@ -82,6 +82,9 @@ static const size_t MAX_CALENDAR_EVENTS = 20;
 static const size_t MAX_SYNC_TASKS = 24;
 static const uint16_t CALENDAR_ALERT_LEAD_MINUTES = 10;
 static const uint32_t CLOUD_SYNC_RETRY_MS = 5UL * 60UL * 1000UL;
+static const size_t MAX_TODO_ENTITY_OPTIONS = 12;
+static const uint32_t POCKET_PET_UPDATE_INTERVAL_MS = 60UL * 1000UL;
+static const uint32_t POCKET_PET_AUTOSAVE_INTERVAL_MS = 5UL * 60UL * 1000UL;
 
 #ifndef CLOUD_CALENDAR_EVENTS_URL
 #define CLOUD_CALENDAR_EVENTS_URL ""
@@ -105,6 +108,10 @@ static const uint32_t CLOUD_SYNC_RETRY_MS = 5UL * 60UL * 1000UL;
 
 #ifndef HA_CALENDAR_ENTITY_ID
 #define HA_CALENDAR_ENTITY_ID ""
+#endif
+
+#ifndef HA_TODO_ENTITY_ID
+#define HA_TODO_ENTITY_ID ""
 #endif
 
 #ifndef DEVICE_TZ
@@ -159,6 +166,7 @@ unsigned long bootPressStartMs = 0;
 
 String configuredSsid;
 String configuredPassword;
+String configuredTodoEntity;
 
 int16_t captureBufferStorage[CAPTURE_SAMPLES] = {0};
 int16_t* captureBuffer = captureBufferStorage;
@@ -204,17 +212,20 @@ lv_obj_t* uiBtnOpenTasks = nullptr;
 lv_obj_t* uiBtnOpenPet = nullptr;
 lv_obj_t* uiLabelPetFace = nullptr;
 lv_obj_t* uiLabelPetSummary = nullptr;
-lv_obj_t* uiLabelPetStatus = nullptr;
+lv_obj_t* uiLabelPetDetail = nullptr;
 lv_obj_t* uiBarPetHunger = nullptr;
+lv_obj_t* uiBarPetHappiness = nullptr;
+lv_obj_t* uiBarPetHealth = nullptr;
 lv_obj_t* uiBarPetEnergy = nullptr;
-lv_obj_t* uiBarPetMood = nullptr;
-lv_obj_t* uiLabelPetRestButton = nullptr;
+lv_obj_t* uiBarPetCleanliness = nullptr;
+lv_obj_t* uiLabelPetSleepButton = nullptr;
 lv_obj_t* uiBtnOpenCalendar = nullptr;
 lv_obj_t* uiBtnOpenSyncTasks = nullptr;
 lv_obj_t* uiListCalendar = nullptr;
 lv_obj_t* uiLabelCalendarStatus = nullptr;
 lv_obj_t* uiListSyncTasks = nullptr;
 lv_obj_t* uiLabelSyncTasksStatus = nullptr;
+lv_obj_t* uiDdTodoEntity = nullptr;
 
 String notesText;
 
@@ -228,15 +239,35 @@ struct TaskItem {
 TaskItem taskQueue[MAX_TASK_ITEMS];
 size_t taskCount = 0;
 
+enum class PocketPetMode : uint8_t {
+  Normal = 0,
+  Eating = 1,
+  Playing = 2,
+  Sleeping = 3,
+  Sick = 4,
+  Hungry = 5,
+  Dead = 6
+};
+
 struct PocketPetState {
-  uint8_t hunger = 30;      // 0 = full, 100 = very hungry
-  uint8_t energy = 82;      // 0 = exhausted, 100 = fully rested
-  uint8_t mood = 76;        // 0 = upset, 100 = very happy
-  bool resting = false;
+  uint8_t hunger = 50;       // Tamapetchi-compatible: higher means more full.
+  uint8_t happiness = 50;
+  uint8_t health = 80;
+  uint8_t energy = 100;
+  uint8_t cleanliness = 80;
+  uint32_t ageMinutes = 0;
+  bool isAlive = true;
+  PocketPetMode mode = PocketPetMode::Normal;
   uint32_t lastTickMs = 0;
+  uint32_t stateChangeMs = 0;
+  uint32_t lastInteractionMs = 0;
+  uint32_t wakeMessageUntilMs = 0;
+  uint32_t lastPersistMs = 0;
 };
 
 PocketPetState pocketPet;
+String pocketPetBannerMessage;
+uint32_t pocketPetBannerUntilMs = 0;
 
 struct CalendarEventItem {
   String id;
@@ -264,168 +295,10 @@ bool cloudSyncRequested = false;
 bool cloudDataLoadedFromCache = false;
 uint32_t lastCloudSyncAttemptMs = 0;
 int32_t lastCloudSyncDayKey = -1;
+bool todoEntityRefreshRequested = false;
+String todoEntityOptions[MAX_TODO_ENTITY_OPTIONS];
+size_t todoEntityOptionCount = 0;
 
-#line 266 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-String clipText(const String& in, size_t maxLen);
-#line 273 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-const char * stateName(AssistantState s);
-#line 293 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-lv_color_t uiStateColor(AssistantState s);
-#line 313 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-const char * uiStateHint(AssistantState s);
-#line 333 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-TouchPoint mapTouchToRotation1(const TouchPoint& raw);
-#line 409 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-void setState(AssistantState nextState, const String& detail);
-#line 423 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-void uiRefreshNow();
-#line 431 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-void uiSetWifiMenuStatus(const String& text);
-#line 466 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-static uint8_t clampPercentInt(int value);
-#line 603 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-void uiSetTalkEnabled(bool enabled);
-#line 700 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-void loadWifiConfig();
-#line 708 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-void saveWifiConfig(const String& ssid, const String& password);
-#line 719 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-void uiSyncWifiFields();
-#line 728 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool isHomeAssistantConfigured();
-#line 732 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-String joinedUrl(const char* base, const String& path);
-#line 740 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-String baseLanguageTag(const String& language);
-#line 751 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-String normalizePhraseForMatch(const String& in);
-#line 773 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool transcriptContainsToken(const String& normalizedTranscript, const String& normalizedToken);
-#line 783 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool transcriptStartsWithToken(const String& normalizedTranscript, const String& normalizedToken);
-#line 791 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool transcriptHasWakePhrase(const String& transcript, String& outMatchedPhrase);
-#line 834 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-String urlAuthority(const String& url);
-#line 847 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-String urlHost(const String& url);
-#line 861 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-uint16_t urlPort(const String& url);
-#line 878 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-String urlEncode(const String& input);
-#line 898 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-String isoUtc(time_t epoch);
-#line 906 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-String formatTimeLabel(time_t epoch, bool includeDate);
-#line 917 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-String formatDateLabel(time_t epoch);
-#line 928 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-time_t timegmCompat(const struct tm* value);
-#line 949 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool parseIsoTimestamp(const String& value, time_t& outEpoch);
-#line 1045 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-int32_t localDayKey(time_t epoch);
-#line 1054 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-String cloudAuthTokenForUrl(const String& url);
-#line 1067 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool httpGetJsonWithAuth(const String& url, String& outBody, String& outError);
-#line 1100 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool httpPostJsonWithAuth(const String& url, const String& payload, String& outError);
-#line 1132 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-void sortCalendarEvents();
-#line 1147 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-void sortSyncedTasks();
-#line 1164 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-String jsonStringOrEmpty(JsonVariantConst v);
-#line 1174 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool parseCalendarPayload(const String& payload, String& outError);
-#line 1259 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool parseSyncedTasksPayload(const String& payload, String& outError);
-#line 1337 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-String resolveCalendarEndpoint();
-#line 1354 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-String resolveTasksEndpoint();
-#line 1361 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool fetchCalendarFromCloud(String& outError);
-#line 1377 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool fetchSyncedTasksFromCloud(String& outError);
-#line 1560 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool postTaskCompletionWebhook(const SyncedTaskItem& task, bool completed, String& outError);
-#line 1760 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-VadSnapshot sampleAnalogVadSnapshot();
-#line 1805 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-VadSnapshot sampleVadSnapshot();
-#line 1833 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-int16_t clampToInt16(int32_t v);
-#line 1843 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-float chooseCaptureGain(float peakNorm);
-#line 1859 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-void applyPcmGain(int16_t* samples, size_t count, float gain);
-#line 1871 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-String buildLevelText(const CaptureMetrics& metrics, float captureGain);
-#line 1881 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-float normToDbFs(float norm);
-#line 1886 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool trimPcmSilenceInPlace(int16_t* samples, size_t& sampleCount, size_t& removedSamples);
-#line 1954 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-void uiUpdateMicLevelLine();
-#line 2002 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool probeAnalogMicPin(int pin);
-#line 2031 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool postProcessAnalogCapture(int16_t* out, size_t sampleCount, CaptureMetrics& metrics);
-#line 2083 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool captureAnalogMicBlocking(int16_t* out, size_t sampleCount, CaptureMetrics& metrics);
-#line 2269 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-uint16_t readLe16(const uint8_t* in);
-#line 2273 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-uint32_t readLe32(const uint8_t* in);
-#line 2280 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-int16_t applyPcmGain(int16_t sample, float gain);
-#line 2291 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-void applyPcmGainBuffer(int16_t* samples, size_t count, float gain);
-#line 2300 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-uint8_t* allocAudioBuffer(size_t bytes);
-#line 2314 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool readExactFromStream(Stream& stream, uint8_t* out, size_t len, uint32_t timeoutMs);
-#line 2336 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool discardStreamBytes(Stream& stream, size_t len, uint32_t timeoutMs);
-#line 2353 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool streamWavDataToSpeaker( Stream& stream, uint32_t dataBytes, uint16_t channels, uint32_t sampleRate, String& outError);
-#line 2506 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool playWavFromStream(Stream& stream, String& outError);
-#line 2606 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-void writeWavHeader(uint8_t* header, size_t dataBytes, uint32_t sampleRate);
-#line 2819 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool beginHttp(HTTPClient& http, WiFiClientSecure& secureClient, const String& url);
-#line 2828 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool isRetryableSttTransportError(int code);
-#line 2837 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-String sttHttpErrorText(int code);
-#line 2856 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool initSdCard();
-#line 2876 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-String nextCapturePath();
-#line 2887 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool saveCaptureToSd(const int16_t* samples, size_t sampleCount, String& outPath, String& outError);
-#line 3071 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool homeAssistantConversation(const String& text, String& outReply, String& outError);
-#line 3130 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-String normalizeTaskCommandText(const String& in);
-#line 3155 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-int nextPendingTaskIndex();
-#line 3219 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool runTaskAtIndex(size_t idx);
-#line 3286 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool homeAssistantFetchCoreUrls(String& outInternalUrl, String& outExternalUrl, String& outError);
-#line 3660 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-bool connectToWifi(const String& ssid, const String& password, uint32_t timeoutMs);
-#line 3747 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-void runCapturePipeline(bool bypassWakeWord, CaptureMode captureMode);
-#line 5193 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-void setup();
-#line 5311 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
-void loop();
-#line 266 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\voice_assistant_es3c28p.ino"
 String clipText(const String& in, size_t maxLen) {
   if (in.length() <= maxLen) {
     return in;
@@ -529,6 +402,9 @@ bool runNextQueuedTask();
 void runAllQueuedTasks();
 void uiUpdatePocketPet();
 void updatePocketPetLoop(uint32_t nowMs);
+void loadPocketPetState();
+void savePocketPetState();
+void pocketPetSetBanner(const String& message, uint32_t durationMs);
 bool syncCloudData(bool force, String& outError);
 bool loadCloudCache(String& outError);
 bool saveCloudCache(String& outError);
@@ -536,6 +412,12 @@ void maybeRunScheduledCloudSync(uint32_t nowMs);
 void checkCalendarAlerts(uint32_t nowMs);
 bool playAlertChime();
 void syncClockIfNeeded();
+bool fetchSyncedTasksFromHomeAssistant(String& outError);
+bool updateTodoItemInHomeAssistant(const SyncedTaskItem& task, bool completed, String& outError);
+String activeTodoEntity();
+void saveTodoEntityConfig(const String& entityId);
+bool fetchTodoEntityOptionsFromHomeAssistant(String& outError);
+void uiRefreshTodoEntityDropdown();
 void requestCapture(CaptureMode mode, bool bypassWakeWord);
 bool homeAssistantTtsGetUrl(const String& text, String& outUrl, String& outError);
 bool homeAssistantPlayTtsWav(const String& ttsUrl, String& outError);
@@ -548,6 +430,8 @@ void uiWifiScanButtonEventCb(lv_event_t* e);
 void uiWifiSaveButtonEventCb(lv_event_t* e);
 void uiWifiConnectButtonEventCb(lv_event_t* e);
 void uiWifiDropdownEventCb(lv_event_t* e);
+void uiTodoEntityDropdownEventCb(lv_event_t* e);
+void uiTodoEntityRefreshButtonEventCb(lv_event_t* e);
 void uiTextareaEventCb(lv_event_t* e);
 void uiKeyboardEventCb(lv_event_t* e);
 void uiDictateButtonEventCb(lv_event_t* e);
@@ -560,6 +444,9 @@ void uiOpenCalendarButtonEventCb(lv_event_t* e);
 void uiOpenSyncTasksButtonEventCb(lv_event_t* e);
 void uiCloudSyncButtonEventCb(lv_event_t* e);
 void uiSyncedTaskToggleEventCb(lv_event_t* e);
+void uiNavHomeButtonEventCb(lv_event_t* e);
+void uiNavPrevButtonEventCb(lv_event_t* e);
+void uiNavNextButtonEventCb(lv_event_t* e);
 void uiTaskQueueButtonEventCb(lv_event_t* e);
 void uiTaskRunNextButtonEventCb(lv_event_t* e);
 void uiTaskRunAllButtonEventCb(lv_event_t* e);
@@ -567,7 +454,10 @@ void uiTaskClearButtonEventCb(lv_event_t* e);
 void uiPocketPetExitButtonEventCb(lv_event_t* e);
 void uiPocketPetFeedButtonEventCb(lv_event_t* e);
 void uiPocketPetPlayButtonEventCb(lv_event_t* e);
-void uiPocketPetRestButtonEventCb(lv_event_t* e);
+void uiPocketPetCleanButtonEventCb(lv_event_t* e);
+void uiPocketPetSleepButtonEventCb(lv_event_t* e);
+void uiPocketPetHealButtonEventCb(lv_event_t* e);
+void uiPocketPetResetButtonEventCb(lv_event_t* e);
 
 void setState(AssistantState nextState, const String& detail) {
   state = nextState;
@@ -636,32 +526,143 @@ static uint8_t clampPercentInt(int value) {
   return static_cast<uint8_t>(value);
 }
 
+const char* pocketPetModeName(PocketPetMode mode) {
+  switch (mode) {
+    case PocketPetMode::Normal:
+      return "Normal";
+    case PocketPetMode::Eating:
+      return "Eating";
+    case PocketPetMode::Playing:
+      return "Playing";
+    case PocketPetMode::Sleeping:
+      return "Sleeping";
+    case PocketPetMode::Sick:
+      return "Sick";
+    case PocketPetMode::Hungry:
+      return "Hungry";
+    case PocketPetMode::Dead:
+      return "Dead";
+  }
+  return "Normal";
+}
+
+void pocketPetSetBanner(const String& message, uint32_t durationMs) {
+  pocketPetBannerMessage = message;
+  if (durationMs == 0) {
+    pocketPetBannerUntilMs = 0;
+    return;
+  }
+  pocketPetBannerUntilMs = millis() + durationMs;
+}
+
+void loadPocketPetState() {
+  Preferences prefs;
+  prefs.begin("pet_cfg", true);
+  pocketPet.hunger = clampPercentInt(static_cast<int>(prefs.getUChar("h", 50)));
+  pocketPet.happiness = clampPercentInt(static_cast<int>(prefs.getUChar("hap", 50)));
+  pocketPet.health = clampPercentInt(static_cast<int>(prefs.getUChar("hl", 80)));
+  pocketPet.energy = clampPercentInt(static_cast<int>(prefs.getUChar("en", 100)));
+  pocketPet.cleanliness = clampPercentInt(static_cast<int>(prefs.getUChar("cln", 80)));
+  pocketPet.ageMinutes = prefs.getUInt("age", 0);
+  pocketPet.isAlive = prefs.getBool("alive", true);
+  uint8_t modeRaw = prefs.getUChar("mode", static_cast<uint8_t>(PocketPetMode::Normal));
+  prefs.end();
+
+  if (modeRaw > static_cast<uint8_t>(PocketPetMode::Dead)) {
+    modeRaw = static_cast<uint8_t>(PocketPetMode::Normal);
+  }
+  pocketPet.mode = static_cast<PocketPetMode>(modeRaw);
+  if (!pocketPet.isAlive) {
+    pocketPet.mode = PocketPetMode::Dead;
+  }
+
+  const uint32_t now = millis();
+  pocketPet.lastTickMs = now;
+  pocketPet.stateChangeMs = now;
+  pocketPet.lastInteractionMs = now;
+  pocketPet.wakeMessageUntilMs = 0;
+  pocketPet.lastPersistMs = now;
+  pocketPetBannerMessage = "";
+  pocketPetBannerUntilMs = 0;
+}
+
+void savePocketPetState() {
+  Preferences prefs;
+  prefs.begin("pet_cfg", false);
+  prefs.putUChar("h", pocketPet.hunger);
+  prefs.putUChar("hap", pocketPet.happiness);
+  prefs.putUChar("hl", pocketPet.health);
+  prefs.putUChar("en", pocketPet.energy);
+  prefs.putUChar("cln", pocketPet.cleanliness);
+  prefs.putUInt("age", pocketPet.ageMinutes);
+  prefs.putBool("alive", pocketPet.isAlive);
+  prefs.putUChar("mode", static_cast<uint8_t>(pocketPet.mode));
+  prefs.end();
+  pocketPet.lastPersistMs = millis();
+}
+
 void uiUpdatePocketPet() {
-  if (!uiLabelPetFace && !uiBarPetHunger && !uiBarPetEnergy && !uiBarPetMood && !uiLabelPetStatus) {
+  if (!uiLabelPetFace && !uiBarPetHunger && !uiBarPetHappiness && !uiBarPetHealth &&
+      !uiBarPetEnergy && !uiBarPetCleanliness && !uiLabelPetDetail) {
     return;
   }
 
-  const bool hungry = pocketPet.hunger >= 72;
-  const bool tired = pocketPet.energy <= 34;
-  const bool lowMood = pocketPet.mood <= 36;
+  const uint32_t now = millis();
+  if (pocketPetBannerUntilMs != 0 && static_cast<int32_t>(now - pocketPetBannerUntilMs) >= 0) {
+    pocketPetBannerUntilMs = 0;
+    pocketPetBannerMessage = "";
+  }
+
+  if (!pocketPet.isAlive) {
+    pocketPet.mode = PocketPetMode::Dead;
+  }
 
   const char* face = "(^_^)";
   String summary = "Happy and alert";
-  if (pocketPet.resting) {
-    face = "(-_-) zZ";
-    summary = "Resting";
-  } else if (hungry && tired) {
-    face = "(x_x)";
-    summary = "Needs food and rest";
-  } else if (hungry) {
-    face = "(o_o)";
-    summary = "Hungry";
-  } else if (tired) {
-    face = "(u_u)";
-    summary = "Low energy";
-  } else if (lowMood) {
-    face = "(._.)";
-    summary = "Needs attention";
+  lv_color_t summaryColor = lv_color_hex(0x93C5FD);
+  switch (pocketPet.mode) {
+    case PocketPetMode::Eating:
+      face = "(^o^)";
+      summary = "Eating";
+      summaryColor = lv_color_hex(0x86EFAC);
+      break;
+    case PocketPetMode::Playing:
+      face = "(^_^)!";
+      summary = "Playing";
+      summaryColor = lv_color_hex(0x67E8F9);
+      break;
+    case PocketPetMode::Sleeping:
+      face = "(-_-) zZ";
+      summary = "Sleeping";
+      summaryColor = lv_color_hex(0xC4B5FD);
+      break;
+    case PocketPetMode::Sick:
+      face = "(._.)";
+      summary = "Feeling sick";
+      summaryColor = lv_color_hex(0xFCA5A5);
+      break;
+    case PocketPetMode::Hungry:
+      face = "(o_o)";
+      summary = "Very hungry";
+      summaryColor = lv_color_hex(0xFDBA74);
+      break;
+    case PocketPetMode::Dead:
+      face = "(x_x)";
+      summary = "Pet has passed away";
+      summaryColor = lv_color_hex(0xF87171);
+      break;
+    case PocketPetMode::Normal:
+    default:
+      if (pocketPet.happiness < 35) {
+        face = "(._.)";
+        summary = "Needs attention";
+        summaryColor = lv_color_hex(0xFDE68A);
+      } else if (pocketPet.health < 40) {
+        face = "(-_-)";
+        summary = "Needs care";
+        summaryColor = lv_color_hex(0xFCA5A5);
+      }
+      break;
   }
 
   if (uiLabelPetFace) {
@@ -669,63 +670,130 @@ void uiUpdatePocketPet() {
   }
   if (uiLabelPetSummary) {
     lv_label_set_text(uiLabelPetSummary, summary.c_str());
-    lv_obj_set_style_text_color(uiLabelPetSummary, lowMood ? lv_color_hex(0xFCA5A5) : lv_color_hex(0x93C5FD), LV_PART_MAIN);
+    lv_obj_set_style_text_color(uiLabelPetSummary, summaryColor, LV_PART_MAIN);
   }
   if (uiBarPetHunger) {
     lv_bar_set_value(uiBarPetHunger, pocketPet.hunger, LV_ANIM_ON);
   }
+  if (uiBarPetHappiness) {
+    lv_bar_set_value(uiBarPetHappiness, pocketPet.happiness, LV_ANIM_ON);
+  }
+  if (uiBarPetHealth) {
+    lv_bar_set_value(uiBarPetHealth, pocketPet.health, LV_ANIM_ON);
+  }
   if (uiBarPetEnergy) {
     lv_bar_set_value(uiBarPetEnergy, pocketPet.energy, LV_ANIM_ON);
   }
-  if (uiBarPetMood) {
-    lv_bar_set_value(uiBarPetMood, pocketPet.mood, LV_ANIM_ON);
+  if (uiBarPetCleanliness) {
+    lv_bar_set_value(uiBarPetCleanliness, pocketPet.cleanliness, LV_ANIM_ON);
   }
-  if (uiLabelPetStatus) {
-    String status = String("H") + String(static_cast<int>(pocketPet.hunger)) +
-                    "%  E" + String(static_cast<int>(pocketPet.energy)) +
-                    "%  M" + String(static_cast<int>(pocketPet.mood)) + "%";
-    lv_label_set_text(uiLabelPetStatus, status.c_str());
+  if (uiLabelPetDetail) {
+    String detail;
+    if (pocketPetBannerMessage.length() > 0) {
+      detail = pocketPetBannerMessage;
+    } else {
+      detail = String("Age ") + String(pocketPet.ageMinutes) + "m | " + pocketPetModeName(pocketPet.mode);
+    }
+    lv_label_set_text(uiLabelPetDetail, detail.c_str());
+    lv_obj_set_style_text_color(uiLabelPetDetail, lv_color_hex(0x9FB3CF), LV_PART_MAIN);
   }
-  if (uiLabelPetRestButton) {
-    lv_label_set_text(uiLabelPetRestButton, pocketPet.resting ? "Wake" : "Rest");
+  if (uiLabelPetSleepButton) {
+    lv_label_set_text(uiLabelPetSleepButton, pocketPet.mode == PocketPetMode::Sleeping ? "Wake" : "Sleep");
   }
 }
 
 void updatePocketPetLoop(uint32_t nowMs) {
+  bool redraw = false;
+  bool saveNeeded = false;
+
   if (pocketPet.lastTickMs == 0) {
     pocketPet.lastTickMs = nowMs;
-    uiUpdatePocketPet();
-    return;
+    redraw = true;
   }
 
-  if (nowMs <= pocketPet.lastTickMs) {
-    return;
+  if (pocketPetBannerUntilMs != 0 && static_cast<int32_t>(nowMs - pocketPetBannerUntilMs) >= 0) {
+    pocketPetBannerUntilMs = 0;
+    pocketPetBannerMessage = "";
+    redraw = true;
   }
 
-  const uint32_t elapsedMs = nowMs - pocketPet.lastTickMs;
-  if (elapsedMs < 1000) {
-    return;
+  // Eating/playing are short-lived action states.
+  if ((pocketPet.mode == PocketPetMode::Eating || pocketPet.mode == PocketPetMode::Playing) &&
+      pocketPet.stateChangeMs != 0 &&
+      static_cast<int32_t>(nowMs - pocketPet.stateChangeMs) >= 5000) {
+    pocketPet.mode = PocketPetMode::Normal;
+    redraw = true;
+    saveNeeded = true;
   }
-  pocketPet.lastTickMs = nowMs;
 
-  const uint32_t ticks = elapsedMs / 1000;
-  for (uint32_t i = 0; i < ticks; i++) {
-    if (pocketPet.resting) {
-      pocketPet.energy = clampPercentInt(static_cast<int>(pocketPet.energy) + 2);
-      pocketPet.hunger = clampPercentInt(static_cast<int>(pocketPet.hunger) + 1);
-      pocketPet.mood = clampPercentInt(static_cast<int>(pocketPet.mood) + (pocketPet.energy >= 80 ? 1 : 0));
-    } else {
-      pocketPet.hunger = clampPercentInt(static_cast<int>(pocketPet.hunger) + 1);
-      pocketPet.energy = clampPercentInt(static_cast<int>(pocketPet.energy) - 1);
-      if (pocketPet.hunger > 75 || pocketPet.energy < 25) {
-        pocketPet.mood = clampPercentInt(static_cast<int>(pocketPet.mood) - 2);
-      } else if (pocketPet.hunger < 45 && pocketPet.energy > 55) {
-        pocketPet.mood = clampPercentInt(static_cast<int>(pocketPet.mood) + 1);
+  if (nowMs > pocketPet.lastTickMs) {
+    const uint32_t elapsedMs = nowMs - pocketPet.lastTickMs;
+    if (elapsedMs >= POCKET_PET_UPDATE_INTERVAL_MS) {
+      const uint32_t ticks = elapsedMs / POCKET_PET_UPDATE_INTERVAL_MS;
+      pocketPet.lastTickMs += ticks * POCKET_PET_UPDATE_INTERVAL_MS;
+
+      for (uint32_t i = 0; i < ticks; i++) {
+        if (!pocketPet.isAlive) {
+          pocketPet.mode = PocketPetMode::Dead;
+          break;
+        }
+
+        if (pocketPet.mode == PocketPetMode::Sleeping) {
+          pocketPet.hunger = clampPercentInt(static_cast<int>(pocketPet.hunger) - 2);
+          pocketPet.happiness = clampPercentInt(static_cast<int>(pocketPet.happiness) - 1);
+          pocketPet.energy = clampPercentInt(static_cast<int>(pocketPet.energy) + 10);
+          pocketPet.cleanliness = clampPercentInt(static_cast<int>(pocketPet.cleanliness) - 2);
+
+          if (pocketPet.energy >= 100) {
+            pocketPet.mode = PocketPetMode::Normal;
+            pocketPet.stateChangeMs = nowMs;
+            pocketPetSetBanner("Woke up fully rested", 2500);
+          }
+        } else {
+          pocketPet.hunger = clampPercentInt(static_cast<int>(pocketPet.hunger) - 5);
+          pocketPet.happiness = clampPercentInt(static_cast<int>(pocketPet.happiness) - 3);
+          pocketPet.energy = clampPercentInt(static_cast<int>(pocketPet.energy) - 2);
+          pocketPet.cleanliness = clampPercentInt(static_cast<int>(pocketPet.cleanliness) - 4);
+        }
+
+        if (pocketPet.hunger < 20 || pocketPet.cleanliness < 20) {
+          pocketPet.health = clampPercentInt(static_cast<int>(pocketPet.health) - 5);
+        }
+
+        if (pocketPet.health == 0) {
+          pocketPet.isAlive = false;
+          pocketPet.mode = PocketPetMode::Dead;
+          pocketPetSetBanner("Pet has passed away. Reset to begin again.", 4500);
+        } else if (pocketPet.mode != PocketPetMode::Dead && pocketPet.mode != PocketPetMode::Sleeping) {
+          if (pocketPet.health < 30 && pocketPet.mode != PocketPetMode::Sick) {
+            pocketPet.mode = PocketPetMode::Sick;
+            pocketPet.stateChangeMs = nowMs;
+          } else if (pocketPet.hunger < 20 && pocketPet.mode != PocketPetMode::Sick && pocketPet.mode != PocketPetMode::Hungry) {
+            pocketPet.mode = PocketPetMode::Hungry;
+            pocketPet.stateChangeMs = nowMs;
+          } else if (pocketPet.mode == PocketPetMode::Hungry && pocketPet.hunger >= 20) {
+            pocketPet.mode = PocketPetMode::Normal;
+          } else if (pocketPet.mode == PocketPetMode::Sick && pocketPet.health >= 30) {
+            pocketPet.mode = PocketPetMode::Normal;
+          }
+        }
+
+        pocketPet.ageMinutes++;
+        saveNeeded = true;
       }
+      redraw = true;
     }
   }
 
-  uiUpdatePocketPet();
+  if (saveNeeded ||
+      (pocketPet.lastPersistMs != 0 && nowMs > pocketPet.lastPersistMs &&
+       (nowMs - pocketPet.lastPersistMs) >= POCKET_PET_AUTOSAVE_INTERVAL_MS)) {
+    savePocketPetState();
+  }
+
+  if (redraw) {
+    uiUpdatePocketPet();
+  }
 }
 
 void uiAppendDictationNote(const String& text) {
@@ -865,6 +933,8 @@ void loadWifiConfig() {
   prefs.begin("voice_cfg", true);
   configuredSsid = prefs.getString("wifi_ssid", WIFI_SSID);
   configuredPassword = prefs.getString("wifi_pwd", WIFI_PASSWORD);
+  String todoDefault = strlen(HA_TODO_ENTITY_ID) > 0 ? String(HA_TODO_ENTITY_ID) : String("todo.to_do_list");
+  configuredTodoEntity = prefs.getString("ha_todo_entity", todoDefault);
   prefs.end();
 }
 
@@ -873,10 +943,26 @@ void saveWifiConfig(const String& ssid, const String& password) {
   prefs.begin("voice_cfg", false);
   prefs.putString("wifi_ssid", ssid);
   prefs.putString("wifi_pwd", password);
+  if (configuredTodoEntity.length() > 0) {
+    prefs.putString("ha_todo_entity", configuredTodoEntity);
+  }
   prefs.end();
 
   configuredSsid = ssid;
   configuredPassword = password;
+}
+
+void saveTodoEntityConfig(const String& entityId) {
+  String cleaned = entityId;
+  cleaned.trim();
+  if (cleaned.length() == 0) {
+    return;
+  }
+  configuredTodoEntity = cleaned;
+  Preferences prefs;
+  prefs.begin("voice_cfg", false);
+  prefs.putString("ha_todo_entity", configuredTodoEntity);
+  prefs.end();
 }
 
 void uiSyncWifiFields() {
@@ -1521,6 +1607,133 @@ String resolveTasksEndpoint() {
   return "";
 }
 
+String activeTodoEntity() {
+  if (configuredTodoEntity.length() > 0) {
+    return configuredTodoEntity;
+  }
+  if (strlen(HA_TODO_ENTITY_ID) > 0) {
+    return String(HA_TODO_ENTITY_ID);
+  }
+  return String("todo.to_do_list");
+}
+
+void uiRefreshTodoEntityDropdown() {
+  if (!uiDdTodoEntity) {
+    return;
+  }
+
+  String options;
+  if (todoEntityOptionCount == 0) {
+    options = activeTodoEntity();
+  } else {
+    for (size_t i = 0; i < todoEntityOptionCount; ++i) {
+      if (i > 0) {
+        options += "\n";
+      }
+      options += todoEntityOptions[i];
+    }
+  }
+  if (options.length() == 0) {
+    options = "todo.to_do_list";
+  }
+  lv_dropdown_set_options(uiDdTodoEntity, options.c_str());
+
+  const String selectedEntity = activeTodoEntity();
+  uint16_t selectedIndex = 0;
+  bool found = false;
+  for (size_t i = 0; i < todoEntityOptionCount; ++i) {
+    if (todoEntityOptions[i].equalsIgnoreCase(selectedEntity)) {
+      selectedIndex = static_cast<uint16_t>(i);
+      found = true;
+      break;
+    }
+  }
+  if (!found && todoEntityOptionCount > 0) {
+    configuredTodoEntity = todoEntityOptions[0];
+    saveTodoEntityConfig(configuredTodoEntity);
+    selectedIndex = 0;
+  }
+  lv_dropdown_set_selected(uiDdTodoEntity, selectedIndex);
+}
+
+bool fetchTodoEntityOptionsFromHomeAssistant(String& outError) {
+  outError = "";
+  if (!isHomeAssistantConfigured()) {
+    outError = "HA not configured";
+    return false;
+  }
+
+  const String endpoint = joinedUrl(HA_BASE_URL, "/api/template");
+  HTTPClient http;
+  WiFiClientSecure secureClient;
+  if (!beginHttp(http, secureClient, endpoint)) {
+    outError = "HA todo-entity query begin failed";
+    return false;
+  }
+  http.setConnectTimeout(STT_CONNECT_TIMEOUT_MS);
+  http.setTimeout(STT_IO_TIMEOUT_MS);
+  http.addHeader("Authorization", String("Bearer ") + HA_ACCESS_TOKEN);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Accept", "application/json");
+
+  DynamicJsonDocument req(512);
+  req["template"] = "{{ states.todo | map(attribute='entity_id') | list | tojson }}";
+  String payload;
+  serializeJson(req, payload);
+
+  const int code = http.POST(payload);
+  if (code <= 0) {
+    outError = String("HA template HTTP ") + code;
+    http.end();
+    return false;
+  }
+
+  String response = http.getString();
+  http.end();
+  if (code < 200 || code >= 300) {
+    outError = String("HA template HTTP ") + code + ": " + clipText(response, 80);
+    return false;
+  }
+
+  DynamicJsonDocument doc(4096);
+  if (deserializeJson(doc, response)) {
+    outError = "HA todo-entity parse failed";
+    return false;
+  }
+  if (!doc.is<JsonArray>()) {
+    outError = "HA todo-entity response not array";
+    return false;
+  }
+
+  todoEntityOptionCount = 0;
+  for (JsonVariant item : doc.as<JsonArray>()) {
+    if (todoEntityOptionCount >= MAX_TODO_ENTITY_OPTIONS) {
+      break;
+    }
+    String entity = jsonStringOrEmpty(item);
+    entity.trim();
+    if (!entity.startsWith("todo.")) {
+      continue;
+    }
+    bool duplicate = false;
+    for (size_t i = 0; i < todoEntityOptionCount; ++i) {
+      if (todoEntityOptions[i].equalsIgnoreCase(entity)) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (!duplicate) {
+      todoEntityOptions[todoEntityOptionCount++] = entity;
+    }
+  }
+
+  if (todoEntityOptionCount == 0) {
+    outError = "No todo.* entities found";
+    return false;
+  }
+  return true;
+}
+
 bool fetchCalendarFromCloud(String& outError) {
   outError = "";
   const String endpoint = resolveCalendarEndpoint();
@@ -1540,17 +1753,139 @@ bool fetchCalendarFromCloud(String& outError) {
 bool fetchSyncedTasksFromCloud(String& outError) {
   outError = "";
   const String endpoint = resolveTasksEndpoint();
-  if (endpoint.length() == 0) {
-    outError = "Task endpoint not configured";
+  if (endpoint.length() > 0) {
+    String body;
+    if (!httpGetJsonWithAuth(endpoint, body, outError)) {
+      return false;
+    }
+    return parseSyncedTasksPayload(body, outError);
+  }
+
+  if (activeTodoEntity().startsWith("todo.") && isHomeAssistantConfigured()) {
+    return fetchSyncedTasksFromHomeAssistant(outError);
+  }
+
+  outError = "Task source not configured";
+  return false;
+}
+
+bool fetchSyncedTasksFromHomeAssistant(String& outError) {
+  outError = "";
+  if (!isHomeAssistantConfigured()) {
+    outError = "HA not configured";
+    return false;
+  }
+  const String todoEntity = activeTodoEntity();
+  if (!todoEntity.startsWith("todo.")) {
+    outError = "HA to-do entity not set";
     return false;
   }
 
-  String body;
-  if (!httpGetJsonWithAuth(endpoint, body, outError)) {
+  const String endpoint = joinedUrl(HA_BASE_URL, "/api/services/todo/get_items?return_response");
+  HTTPClient http;
+  WiFiClientSecure secureClient;
+  if (!beginHttp(http, secureClient, endpoint)) {
+    outError = "HA to-do request begin failed";
+    return false;
+  }
+  http.setConnectTimeout(STT_CONNECT_TIMEOUT_MS);
+  http.setTimeout(STT_IO_TIMEOUT_MS);
+  http.addHeader("Authorization", String("Bearer ") + HA_ACCESS_TOKEN);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Accept", "application/json");
+
+  DynamicJsonDocument req(512);
+  JsonObject target = req.createNestedObject("target");
+  JsonArray entityList = target.createNestedArray("entity_id");
+  entityList.add(todoEntity);
+  JsonObject data = req.createNestedObject("data");
+  JsonArray statuses = data.createNestedArray("status");
+  statuses.add("needs_action");
+  statuses.add("completed");
+  String payload;
+  serializeJson(req, payload);
+
+  const int code = http.POST(payload);
+  if (code <= 0) {
+    outError = String("HA to-do HTTP ") + code;
+    http.end();
     return false;
   }
 
-  return parseSyncedTasksPayload(body, outError);
+  const String response = http.getString();
+  http.end();
+  if (code < 200 || code >= 300) {
+    outError = String("HA to-do HTTP ") + code + ": " + clipText(response, 80);
+    return false;
+  }
+
+  DynamicJsonDocument doc(16384);
+  if (deserializeJson(doc, response)) {
+    outError = "HA to-do JSON parse failed";
+    return false;
+  }
+
+  JsonVariant serviceResponse = doc["service_response"];
+  if (serviceResponse.isNull()) {
+    serviceResponse = doc.as<JsonVariant>();
+  }
+
+  JsonArray itemsArray;
+  if (serviceResponse[todoEntity]["items"].is<JsonArray>()) {
+    itemsArray = serviceResponse[todoEntity]["items"].as<JsonArray>();
+  } else if (serviceResponse["items"].is<JsonArray>()) {
+    itemsArray = serviceResponse["items"].as<JsonArray>();
+  } else if (serviceResponse.is<JsonObject>()) {
+    for (JsonPair kv : serviceResponse.as<JsonObject>()) {
+      if (kv.value()["items"].is<JsonArray>()) {
+        itemsArray = kv.value()["items"].as<JsonArray>();
+        break;
+      }
+    }
+  }
+
+  if (itemsArray.isNull()) {
+    outError = "HA to-do response missing items";
+    return false;
+  }
+
+  syncedTaskCount = 0;
+  for (JsonVariant item : itemsArray) {
+    if (syncedTaskCount >= MAX_SYNC_TASKS) {
+      break;
+    }
+
+    const String title = jsonStringOrEmpty(item["summary"]);
+    if (title.length() == 0) {
+      continue;
+    }
+
+    String uid = jsonStringOrEmpty(item["uid"]);
+    if (uid.length() == 0) {
+      uid = title;
+    }
+
+    const String status = jsonStringOrEmpty(item["status"]);
+    const bool completed = status.equalsIgnoreCase("completed");
+
+    String dueLabel = jsonStringOrEmpty(item["due_date"]);
+    if (dueLabel.length() == 0) {
+      dueLabel = jsonStringOrEmpty(item["due_datetime"]);
+    }
+    time_t dueEpoch = 0;
+    if (parseIsoTimestamp(dueLabel, dueEpoch)) {
+      dueLabel = formatDateLabel(dueEpoch);
+    }
+
+    SyncedTaskItem& t = syncedTasks[syncedTaskCount++];
+    t.id = uid;
+    t.title = title;
+    t.dueLabel = dueLabel;
+    t.completed = completed;
+  }
+
+  sortSyncedTasks();
+  return true;
 }
 
 bool saveCloudCache(String& outError) {
@@ -1737,6 +2072,75 @@ bool postTaskCompletionWebhook(const SyncedTaskItem& task, bool completed, Strin
   return httpPostJsonWithAuth(String(CLOUD_TASK_COMPLETE_WEBHOOK_URL), payload, outError);
 }
 
+bool updateTodoItemInHomeAssistant(const SyncedTaskItem& task, bool completed, String& outError) {
+  outError = "";
+  if (!isHomeAssistantConfigured()) {
+    outError = "HA not configured";
+    return false;
+  }
+  const String todoEntity = activeTodoEntity();
+  if (!todoEntity.startsWith("todo.")) {
+    outError = "HA to-do entity not set";
+    return false;
+  }
+
+  const String endpoint = joinedUrl(HA_BASE_URL, "/api/services/todo/update_item");
+  auto sendUpdate = [&](const String& itemRef, String& err) -> bool {
+    if (itemRef.length() == 0) {
+      err = "Empty item reference";
+      return false;
+    }
+
+    HTTPClient http;
+    WiFiClientSecure secureClient;
+    if (!beginHttp(http, secureClient, endpoint)) {
+      err = "HA to-do update begin failed";
+      return false;
+    }
+    http.setConnectTimeout(STT_CONNECT_TIMEOUT_MS);
+    http.setTimeout(STT_IO_TIMEOUT_MS);
+    http.addHeader("Authorization", String("Bearer ") + HA_ACCESS_TOKEN);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Accept", "application/json");
+
+    DynamicJsonDocument req(512);
+    JsonObject target = req.createNestedObject("target");
+    JsonArray entityList = target.createNestedArray("entity_id");
+    entityList.add(todoEntity);
+    JsonObject data = req.createNestedObject("data");
+    data["item"] = itemRef;
+    data["status"] = completed ? "completed" : "needs_action";
+
+    String payload;
+    serializeJson(req, payload);
+    const int code = http.POST(payload);
+    const String response = http.getString();
+    http.end();
+    if (code >= 200 && code < 300) {
+      return true;
+    }
+    err = String("HA to-do HTTP ") + code + ": " + clipText(response, 80);
+    return false;
+  };
+
+  String attemptErr;
+  if (sendUpdate(task.id, attemptErr)) {
+    return true;
+  }
+
+  if (task.title != task.id && task.title.length() > 0) {
+    String fallbackErr;
+    if (sendUpdate(task.title, fallbackErr)) {
+      return true;
+    }
+    outError = fallbackErr;
+    return false;
+  }
+
+  outError = attemptErr;
+  return false;
+}
+
 bool playAlertChime() {
   if (!i2sMicReady) {
     return false;
@@ -1876,7 +2280,9 @@ bool syncCloudData(bool force, String& outError) {
   }
 
   String errTasks;
-  if (resolveTasksEndpoint().length() > 0) {
+  const bool hasTasksSource =
+      resolveTasksEndpoint().length() > 0 || (activeTodoEntity().startsWith("todo.") && isHomeAssistantConfigured());
+  if (hasTasksSource) {
     if (fetchSyncedTasksFromCloud(errTasks)) {
       anySuccess = true;
       uiSetSyncTasksStatus("Tasks synced");
@@ -1885,7 +2291,7 @@ bool syncCloudData(bool force, String& outError) {
       uiSetSyncTasksStatus("Task sync failed: " + clipText(errTasks, 40));
     }
   } else {
-    uiSetSyncTasksStatus("Task endpoint not configured");
+    uiSetSyncTasksStatus("Task source not configured");
   }
 
   if (!anySuccess) {
@@ -4329,6 +4735,31 @@ void uiCloudSyncButtonEventCb(lv_event_t* e) {
   uiSetSyncTasksStatus("Sync requested...");
 }
 
+void uiNavHomeButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !uiTabview) {
+    return;
+  }
+  lv_tabview_set_act(uiTabview, TAB_INDEX_HOME, LV_ANIM_ON);
+}
+
+void uiNavPrevButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !uiTabview) {
+    return;
+  }
+  const uint16_t current = lv_tabview_get_tab_act(uiTabview);
+  const uint16_t prev = current == 0 ? (TAB_COUNT - 1) : (current - 1);
+  lv_tabview_set_act(uiTabview, prev, LV_ANIM_ON);
+}
+
+void uiNavNextButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !uiTabview) {
+    return;
+  }
+  const uint16_t current = lv_tabview_get_tab_act(uiTabview);
+  const uint16_t next = (current + 1) % TAB_COUNT;
+  lv_tabview_set_act(uiTabview, next, LV_ANIM_ON);
+}
+
 void uiSyncedTaskToggleEventCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
     return;
@@ -4352,8 +4783,13 @@ void uiSyncedTaskToggleEventCb(lv_event_t* e) {
 
   String postErr;
   bool cloudUpdated = false;
-  if (WiFi.status() == WL_CONNECTED && strlen(CLOUD_TASK_COMPLETE_WEBHOOK_URL) > 0) {
-    cloudUpdated = postTaskCompletionWebhook(updatedTask, nowCompleted, postErr);
+  const bool hasHaTodo = activeTodoEntity().startsWith("todo.") && isHomeAssistantConfigured();
+  if (WiFi.status() == WL_CONNECTED) {
+    if (hasHaTodo) {
+      cloudUpdated = updateTodoItemInHomeAssistant(updatedTask, nowCompleted, postErr);
+    } else if (strlen(CLOUD_TASK_COMPLETE_WEBHOOK_URL) > 0) {
+      cloudUpdated = postTaskCompletionWebhook(updatedTask, nowCompleted, postErr);
+    }
   }
 
   String cacheErr;
@@ -4361,10 +4797,10 @@ void uiSyncedTaskToggleEventCb(lv_event_t* e) {
 
   if (cloudUpdated) {
     uiSetSyncTasksStatus("Task updated in cloud");
-  } else if (strlen(CLOUD_TASK_COMPLETE_WEBHOOK_URL) > 0) {
+  } else if (hasHaTodo || strlen(CLOUD_TASK_COMPLETE_WEBHOOK_URL) > 0) {
     uiSetSyncTasksStatus("Local update only: " + clipText(postErr, 36));
   } else {
-    uiSetSyncTasksStatus("Saved locally (set task webhook to sync)");
+    uiSetSyncTasksStatus("Saved locally (set HA to-do source to sync)");
   }
 }
 
@@ -4381,10 +4817,22 @@ void uiPocketPetFeedButtonEventCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
     return;
   }
-  pocketPet.hunger = clampPercentInt(static_cast<int>(pocketPet.hunger) - 26);
-  pocketPet.energy = clampPercentInt(static_cast<int>(pocketPet.energy) + 6);
-  pocketPet.mood = clampPercentInt(static_cast<int>(pocketPet.mood) + 4);
-  pocketPet.resting = false;
+  if (!pocketPet.isAlive) {
+    pocketPetSetBanner("Pet is not alive", 2200);
+    uiUpdatePocketPet();
+    return;
+  }
+  const bool wasVeryHungry = pocketPet.hunger < 20;
+  pocketPet.hunger = clampPercentInt(static_cast<int>(pocketPet.hunger) + 20);
+  pocketPet.energy = clampPercentInt(static_cast<int>(pocketPet.energy) - 5);
+  if (wasVeryHungry) {
+    pocketPet.health = clampPercentInt(static_cast<int>(pocketPet.health) + 5);
+  }
+  pocketPet.mode = PocketPetMode::Eating;
+  pocketPet.stateChangeMs = millis();
+  pocketPet.lastInteractionMs = pocketPet.stateChangeMs;
+  pocketPetSetBanner("Fed your pet", 2200);
+  savePocketPetState();
   uiUpdatePocketPet();
 }
 
@@ -4392,18 +4840,102 @@ void uiPocketPetPlayButtonEventCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
     return;
   }
-  pocketPet.energy = clampPercentInt(static_cast<int>(pocketPet.energy) - 12);
-  pocketPet.hunger = clampPercentInt(static_cast<int>(pocketPet.hunger) + 8);
-  pocketPet.mood = clampPercentInt(static_cast<int>(pocketPet.mood) + 12);
-  pocketPet.resting = false;
+  if (!pocketPet.isAlive) {
+    pocketPetSetBanner("Pet is not alive", 2200);
+    uiUpdatePocketPet();
+    return;
+  }
+  if (pocketPet.energy < 10) {
+    pocketPetSetBanner("Too tired to play", 2200);
+    uiUpdatePocketPet();
+    return;
+  }
+  pocketPet.happiness = clampPercentInt(static_cast<int>(pocketPet.happiness) + 15);
+  pocketPet.energy = clampPercentInt(static_cast<int>(pocketPet.energy) - 15);
+  pocketPet.hunger = clampPercentInt(static_cast<int>(pocketPet.hunger) - 10);
+  pocketPet.mode = PocketPetMode::Playing;
+  pocketPet.stateChangeMs = millis();
+  pocketPet.lastInteractionMs = pocketPet.stateChangeMs;
+  pocketPetSetBanner("Play time", 2200);
+  savePocketPetState();
   uiUpdatePocketPet();
 }
 
-void uiPocketPetRestButtonEventCb(lv_event_t* e) {
+void uiPocketPetCleanButtonEventCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
     return;
   }
-  pocketPet.resting = !pocketPet.resting;
+  if (!pocketPet.isAlive) {
+    pocketPetSetBanner("Pet is not alive", 2200);
+    uiUpdatePocketPet();
+    return;
+  }
+  pocketPet.cleanliness = 100;
+  pocketPet.health = clampPercentInt(static_cast<int>(pocketPet.health) + 5);
+  pocketPet.lastInteractionMs = millis();
+  pocketPetSetBanner("Fresh and clean", 2200);
+  savePocketPetState();
+  uiUpdatePocketPet();
+}
+
+void uiPocketPetSleepButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  if (!pocketPet.isAlive) {
+    pocketPetSetBanner("Pet is not alive", 2200);
+    uiUpdatePocketPet();
+    return;
+  }
+  const bool sleeping = pocketPet.mode == PocketPetMode::Sleeping;
+  if (sleeping) {
+    pocketPet.mode = PocketPetMode::Normal;
+    pocketPetSetBanner("Pet is awake", 2200);
+  } else {
+    pocketPet.mode = PocketPetMode::Sleeping;
+    pocketPet.stateChangeMs = millis();
+    pocketPetSetBanner("Pet is sleeping", 2200);
+  }
+  pocketPet.lastInteractionMs = millis();
+  savePocketPetState();
+  uiUpdatePocketPet();
+}
+
+void uiPocketPetHealButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  if (!pocketPet.isAlive) {
+    pocketPetSetBanner("Pet is not alive", 2200);
+    uiUpdatePocketPet();
+    return;
+  }
+  pocketPet.health = 100;
+  pocketPet.mode = PocketPetMode::Normal;
+  pocketPet.stateChangeMs = millis();
+  pocketPet.lastInteractionMs = pocketPet.stateChangeMs;
+  pocketPetSetBanner("Health restored", 2200);
+  savePocketPetState();
+  uiUpdatePocketPet();
+}
+
+void uiPocketPetResetButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  pocketPet.hunger = 50;
+  pocketPet.happiness = 50;
+  pocketPet.health = 80;
+  pocketPet.energy = 100;
+  pocketPet.cleanliness = 80;
+  pocketPet.ageMinutes = 0;
+  pocketPet.isAlive = true;
+  pocketPet.mode = PocketPetMode::Normal;
+  pocketPet.stateChangeMs = millis();
+  pocketPet.lastInteractionMs = pocketPet.stateChangeMs;
+  pocketPet.lastTickMs = millis();
+  pocketPetSetBanner("New pet adopted", 2600);
+  savePocketPetState();
   uiUpdatePocketPet();
 }
 
@@ -4472,6 +5004,32 @@ void uiWifiDropdownEventCb(lv_event_t* e) {
   char selected[64] = {0};
   lv_dropdown_get_selected_str(uiDdSsid, selected, sizeof(selected));
   lv_textarea_set_text(uiTaSsid, selected);
+}
+
+void uiTodoEntityDropdownEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED || !uiDdTodoEntity) {
+    return;
+  }
+
+  char selected[96] = {0};
+  lv_dropdown_get_selected_str(uiDdTodoEntity, selected, sizeof(selected));
+  String entity = String(selected);
+  entity.trim();
+  if (!entity.startsWith("todo.")) {
+    return;
+  }
+
+  saveTodoEntityConfig(entity);
+  uiSetSyncTasksStatus(String("Selected list: ") + clipText(entity, 30));
+  cloudSyncRequested = true;
+}
+
+void uiTodoEntityRefreshButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  todoEntityRefreshRequested = true;
+  uiSetSyncTasksStatus("Refreshing to-do lists...");
 }
 
 void uiShowKeyboardFor(lv_obj_t* ta) {
@@ -4557,6 +5115,63 @@ void buildUi() {
   lv_obj_set_style_bg_opa(tabCalendar, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_bg_color(tabSyncTasks, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(tabSyncTasks, LV_OPA_COVER, LV_PART_MAIN);
+
+  auto addStandardNav = [&](lv_obj_t* tab, const char* title) {
+    lv_obj_t* nav = lv_obj_create(tab);
+    lv_obj_set_size(nav, SCREEN_WIDTH, 30);
+    lv_obj_align(nav, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(nav, lv_color_hex(0x0E1622), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(nav, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(nav, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(nav, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(nav, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(nav, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* btnHome = lv_btn_create(nav);
+    lv_obj_set_size(btnHome, 48, 22);
+    lv_obj_align(btnHome, LV_ALIGN_LEFT_MID, 4, 0);
+    lv_obj_set_style_radius(btnHome, 6, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btnHome, lv_color_hex(0x1E293B), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(btnHome, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_add_event_cb(btnHome, uiNavHomeButtonEventCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* homeLabel = lv_label_create(btnHome);
+    lv_label_set_text(homeLabel, "Home");
+    lv_obj_center(homeLabel);
+
+    lv_obj_t* btnPrev = lv_btn_create(nav);
+    lv_obj_set_size(btnPrev, 32, 22);
+    lv_obj_align(btnPrev, LV_ALIGN_RIGHT_MID, -40, 0);
+    lv_obj_set_style_radius(btnPrev, 6, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btnPrev, lv_color_hex(0x1E293B), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(btnPrev, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_add_event_cb(btnPrev, uiNavPrevButtonEventCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* prevLabel = lv_label_create(btnPrev);
+    lv_label_set_text(prevLabel, "<");
+    lv_obj_center(prevLabel);
+
+    lv_obj_t* btnNext = lv_btn_create(nav);
+    lv_obj_set_size(btnNext, 32, 22);
+    lv_obj_align(btnNext, LV_ALIGN_RIGHT_MID, -4, 0);
+    lv_obj_set_style_radius(btnNext, 6, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btnNext, lv_color_hex(0x1E293B), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(btnNext, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_add_event_cb(btnNext, uiNavNextButtonEventCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* nextLabel = lv_label_create(btnNext);
+    lv_label_set_text(nextLabel, ">");
+    lv_obj_center(nextLabel);
+
+    lv_obj_t* titleLabel = lv_label_create(nav);
+    lv_label_set_text(titleLabel, title);
+    lv_obj_set_style_text_color(titleLabel, lv_color_hex(0xCBD5E1), LV_PART_MAIN);
+    lv_obj_align(titleLabel, LV_ALIGN_CENTER, 0, 0);
+  };
+
+  addStandardNav(tabConfig, "Config");
+  addStandardNav(tabNotes, "Notes");
+  addStandardNav(tabTasks, "Queue");
+  addStandardNav(tabPocketPet, "Pocket Pet");
+  addStandardNav(tabCalendar, "Calendar");
+  addStandardNav(tabSyncTasks, "To-Dos");
 
   lv_obj_t* statusBar = lv_obj_create(tabMain);
   lv_obj_set_size(statusBar, SCREEN_WIDTH - 12, 62);
@@ -4738,12 +5353,12 @@ void buildUi() {
   styleLauncherLabel(uiLabelSyncLauncher, 0x86EFAC);
 
   lv_obj_t* labelSsid = lv_label_create(tabConfig);
-  lv_obj_align(labelSsid, LV_ALIGN_TOP_LEFT, 8, 8);
+  lv_obj_align(labelSsid, LV_ALIGN_TOP_LEFT, 8, 36);
   lv_label_set_text(labelSsid, "Wi-Fi Networks");
 
   uiDdSsid = lv_dropdown_create(tabConfig);
   lv_obj_set_width(uiDdSsid, 206);
-  lv_obj_align(uiDdSsid, LV_ALIGN_TOP_LEFT, 8, 30);
+  lv_obj_align(uiDdSsid, LV_ALIGN_TOP_LEFT, 8, 58);
   lv_obj_set_style_radius(uiDdSsid, 10, LV_PART_MAIN);
   lv_obj_set_style_bg_color(uiDdSsid, lv_color_hex(0x10233C), LV_PART_MAIN);
   lv_obj_set_style_text_color(uiDdSsid, lv_color_hex(0xEAF2FF), LV_PART_MAIN);
@@ -4752,7 +5367,7 @@ void buildUi() {
 
   lv_obj_t* btnScan = lv_btn_create(tabConfig);
   lv_obj_set_size(btnScan, 94, 36);
-  lv_obj_align(btnScan, LV_ALIGN_TOP_RIGHT, -8, 30);
+  lv_obj_align(btnScan, LV_ALIGN_TOP_RIGHT, -8, 58);
   lv_obj_set_style_radius(btnScan, 12, LV_PART_MAIN);
   lv_obj_set_style_bg_color(btnScan, lv_color_hex(0x2563EB), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(btnScan, LV_OPA_COVER, LV_PART_MAIN);
@@ -4762,12 +5377,12 @@ void buildUi() {
   lv_obj_center(btnScanLabel);
 
   lv_obj_t* labelManual = lv_label_create(tabConfig);
-  lv_obj_align(labelManual, LV_ALIGN_TOP_LEFT, 8, 74);
+  lv_obj_align(labelManual, LV_ALIGN_TOP_LEFT, 8, 102);
   lv_label_set_text(labelManual, "SSID");
 
   uiTaSsid = lv_textarea_create(tabConfig);
   lv_obj_set_width(uiTaSsid, SCREEN_WIDTH - 16);
-  lv_obj_align(uiTaSsid, LV_ALIGN_TOP_LEFT, 8, 94);
+  lv_obj_align(uiTaSsid, LV_ALIGN_TOP_LEFT, 8, 122);
   lv_textarea_set_one_line(uiTaSsid, true);
   lv_textarea_set_max_length(uiTaSsid, 63);
   lv_textarea_set_placeholder_text(uiTaSsid, "Enter SSID");
@@ -4777,12 +5392,12 @@ void buildUi() {
   lv_obj_add_event_cb(uiTaSsid, uiTextareaEventCb, LV_EVENT_FOCUSED, nullptr);
 
   lv_obj_t* labelPwd = lv_label_create(tabConfig);
-  lv_obj_align(labelPwd, LV_ALIGN_TOP_LEFT, 8, 132);
+  lv_obj_align(labelPwd, LV_ALIGN_TOP_LEFT, 8, 160);
   lv_label_set_text(labelPwd, "Password");
 
   uiTaPassword = lv_textarea_create(tabConfig);
   lv_obj_set_width(uiTaPassword, SCREEN_WIDTH - 16);
-  lv_obj_align(uiTaPassword, LV_ALIGN_TOP_LEFT, 8, 152);
+  lv_obj_align(uiTaPassword, LV_ALIGN_TOP_LEFT, 8, 180);
   lv_textarea_set_one_line(uiTaPassword, true);
   lv_textarea_set_max_length(uiTaPassword, 63);
   lv_textarea_set_placeholder_text(uiTaPassword, "Enter password");
@@ -4822,12 +5437,12 @@ void buildUi() {
   lv_obj_set_style_text_color(uiLabelWifiMenuStatus, lv_color_hex(0x9FB3CF), LV_PART_MAIN);
 
   lv_obj_t* notesTitle = lv_label_create(tabNotes);
-  lv_obj_align(notesTitle, LV_ALIGN_TOP_LEFT, 8, 8);
+  lv_obj_align(notesTitle, LV_ALIGN_TOP_LEFT, 8, 36);
   lv_label_set_text(notesTitle, "Dictation Notes");
 
   uiTaNotes = lv_textarea_create(tabNotes);
   lv_obj_set_size(uiTaNotes, SCREEN_WIDTH - 16, 146);
-  lv_obj_align(uiTaNotes, LV_ALIGN_TOP_LEFT, 8, 28);
+  lv_obj_align(uiTaNotes, LV_ALIGN_TOP_LEFT, 8, 56);
   lv_textarea_set_one_line(uiTaNotes, false);
   lv_textarea_set_text(uiTaNotes, "");
   lv_textarea_set_placeholder_text(uiTaNotes, "Dictated notes will appear here...");
@@ -4866,12 +5481,12 @@ void buildUi() {
   lv_obj_set_style_text_color(uiLabelNotesStatus, lv_color_hex(0x9FB3CF), LV_PART_MAIN);
 
   lv_obj_t* tasksTitle = lv_label_create(tabTasks);
-  lv_obj_align(tasksTitle, LV_ALIGN_TOP_LEFT, 8, 8);
+  lv_obj_align(tasksTitle, LV_ALIGN_TOP_LEFT, 8, 36);
   lv_label_set_text(tasksTitle, "Command Queue");
 
   uiTaTaskInput = lv_textarea_create(tabTasks);
   lv_obj_set_width(uiTaTaskInput, SCREEN_WIDTH - 16);
-  lv_obj_align(uiTaTaskInput, LV_ALIGN_TOP_LEFT, 8, 26);
+  lv_obj_align(uiTaTaskInput, LV_ALIGN_TOP_LEFT, 8, 54);
   lv_textarea_set_one_line(uiTaTaskInput, true);
   lv_textarea_set_max_length(uiTaTaskInput, 140);
   lv_textarea_set_placeholder_text(uiTaTaskInput, "Type command: 'turn off office lights'");
@@ -4882,7 +5497,7 @@ void buildUi() {
 
   uiBtnTaskQueue = lv_btn_create(tabTasks);
   lv_obj_set_size(uiBtnTaskQueue, 108, 32);
-  lv_obj_align(uiBtnTaskQueue, LV_ALIGN_TOP_LEFT, 8, 64);
+  lv_obj_align(uiBtnTaskQueue, LV_ALIGN_TOP_LEFT, 8, 92);
   lv_obj_set_style_radius(uiBtnTaskQueue, 10, LV_PART_MAIN);
   lv_obj_set_style_bg_color(uiBtnTaskQueue, lv_color_hex(0x0F766E), LV_PART_MAIN);
   lv_obj_add_event_cb(uiBtnTaskQueue, uiTaskQueueButtonEventCb, LV_EVENT_CLICKED, nullptr);
@@ -4892,7 +5507,7 @@ void buildUi() {
 
   uiBtnTaskRunNext = lv_btn_create(tabTasks);
   lv_obj_set_size(uiBtnTaskRunNext, 108, 32);
-  lv_obj_align(uiBtnTaskRunNext, LV_ALIGN_TOP_RIGHT, -8, 64);
+  lv_obj_align(uiBtnTaskRunNext, LV_ALIGN_TOP_RIGHT, -8, 92);
   lv_obj_set_style_radius(uiBtnTaskRunNext, 10, LV_PART_MAIN);
   lv_obj_set_style_bg_color(uiBtnTaskRunNext, lv_color_hex(0x1D4ED8), LV_PART_MAIN);
   lv_obj_add_event_cb(uiBtnTaskRunNext, uiTaskRunNextButtonEventCb, LV_EVENT_CLICKED, nullptr);
@@ -4902,7 +5517,7 @@ void buildUi() {
 
   uiBtnTaskRunAll = lv_btn_create(tabTasks);
   lv_obj_set_size(uiBtnTaskRunAll, 108, 32);
-  lv_obj_align(uiBtnTaskRunAll, LV_ALIGN_TOP_LEFT, 8, 100);
+  lv_obj_align(uiBtnTaskRunAll, LV_ALIGN_TOP_LEFT, 8, 128);
   lv_obj_set_style_radius(uiBtnTaskRunAll, 10, LV_PART_MAIN);
   lv_obj_set_style_bg_color(uiBtnTaskRunAll, lv_color_hex(0x2563EB), LV_PART_MAIN);
   lv_obj_add_event_cb(uiBtnTaskRunAll, uiTaskRunAllButtonEventCb, LV_EVENT_CLICKED, nullptr);
@@ -4912,7 +5527,7 @@ void buildUi() {
 
   uiBtnTaskClear = lv_btn_create(tabTasks);
   lv_obj_set_size(uiBtnTaskClear, 108, 32);
-  lv_obj_align(uiBtnTaskClear, LV_ALIGN_TOP_RIGHT, -8, 100);
+  lv_obj_align(uiBtnTaskClear, LV_ALIGN_TOP_RIGHT, -8, 128);
   lv_obj_set_style_radius(uiBtnTaskClear, 10, LV_PART_MAIN);
   lv_obj_set_style_bg_color(uiBtnTaskClear, lv_color_hex(0x475569), LV_PART_MAIN);
   lv_obj_add_event_cb(uiBtnTaskClear, uiTaskClearButtonEventCb, LV_EVENT_CLICKED, nullptr);
@@ -4922,7 +5537,7 @@ void buildUi() {
 
   uiTaTaskLog = lv_textarea_create(tabTasks);
   lv_obj_set_size(uiTaTaskLog, SCREEN_WIDTH - 16, 142);
-  lv_obj_align(uiTaTaskLog, LV_ALIGN_TOP_LEFT, 8, 136);
+  lv_obj_align(uiTaTaskLog, LV_ALIGN_TOP_LEFT, 8, 164);
   lv_textarea_set_one_line(uiTaTaskLog, false);
   lv_textarea_set_text(uiTaTaskLog, "No queued commands.\n\nUse Queue to add one.");
   lv_obj_set_style_radius(uiTaTaskLog, 10, LV_PART_MAIN);
@@ -4940,13 +5555,13 @@ void buildUi() {
   lv_obj_set_style_text_color(uiLabelTaskStatus, lv_color_hex(0x9FB3CF), LV_PART_MAIN);
 
   lv_obj_t* petTitle = lv_label_create(tabPocketPet);
-  lv_obj_align(petTitle, LV_ALIGN_TOP_LEFT, 8, 10);
-  lv_label_set_text(petTitle, "Pocket Pet");
+  lv_obj_align(petTitle, LV_ALIGN_TOP_LEFT, 8, 38);
+  lv_label_set_text(petTitle, "Pocket Pet (TamaPetchi)");
   lv_obj_set_style_text_color(petTitle, lv_color_hex(0x86EFAC), LV_PART_MAIN);
 
   lv_obj_t* btnPetExit = lv_btn_create(tabPocketPet);
   lv_obj_set_size(btnPetExit, 74, 30);
-  lv_obj_align(btnPetExit, LV_ALIGN_TOP_RIGHT, -8, 6);
+  lv_obj_align(btnPetExit, LV_ALIGN_TOP_RIGHT, -8, 34);
   lv_obj_set_style_radius(btnPetExit, 8, LV_PART_MAIN);
   lv_obj_set_style_bg_color(btnPetExit, lv_color_hex(0x334155), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(btnPetExit, LV_OPA_COVER, LV_PART_MAIN);
@@ -4957,7 +5572,7 @@ void buildUi() {
 
   lv_obj_t* petPanel = lv_obj_create(tabPocketPet);
   lv_obj_set_size(petPanel, SCREEN_WIDTH - 16, 228);
-  lv_obj_align(petPanel, LV_ALIGN_TOP_MID, 0, 40);
+  lv_obj_align(petPanel, LV_ALIGN_TOP_MID, 0, 68);
   lv_obj_set_style_bg_color(petPanel, lv_color_hex(0x101010), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(petPanel, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_border_color(petPanel, lv_color_hex(0x2E5A46), LV_PART_MAIN);
@@ -4974,48 +5589,79 @@ void buildUi() {
 
   uiLabelPetSummary = lv_label_create(petPanel);
   lv_obj_align(uiLabelPetSummary, LV_ALIGN_TOP_MID, 0, 24);
-  lv_label_set_text(uiLabelPetSummary, "Happy and alert");
+  lv_label_set_text(uiLabelPetSummary, "Ready");
   lv_obj_set_style_text_color(uiLabelPetSummary, lv_color_hex(0x93C5FD), LV_PART_MAIN);
 
   lv_obj_t* petLabelHunger = lv_label_create(petPanel);
-  lv_obj_align(petLabelHunger, LV_ALIGN_TOP_LEFT, 4, 58);
+  lv_obj_align(petLabelHunger, LV_ALIGN_TOP_LEFT, 4, 50);
   lv_label_set_text(petLabelHunger, "Hunger");
   lv_obj_set_style_text_color(petLabelHunger, lv_color_hex(0xFCA5A5), LV_PART_MAIN);
 
   uiBarPetHunger = lv_bar_create(petPanel);
-  lv_obj_set_size(uiBarPetHunger, 126, 12);
-  lv_obj_align(uiBarPetHunger, LV_ALIGN_TOP_RIGHT, -4, 60);
+  lv_obj_set_size(uiBarPetHunger, 126, 10);
+  lv_obj_align(uiBarPetHunger, LV_ALIGN_TOP_RIGHT, -4, 52);
   lv_bar_set_range(uiBarPetHunger, 0, 100);
   lv_obj_set_style_bg_color(uiBarPetHunger, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
   lv_obj_set_style_bg_color(uiBarPetHunger, lv_color_hex(0xF97316), LV_PART_INDICATOR);
 
+  lv_obj_t* petLabelHappiness = lv_label_create(petPanel);
+  lv_obj_align(petLabelHappiness, LV_ALIGN_TOP_LEFT, 4, 68);
+  lv_label_set_text(petLabelHappiness, "Happy");
+  lv_obj_set_style_text_color(petLabelHappiness, lv_color_hex(0xFDE68A), LV_PART_MAIN);
+
+  uiBarPetHappiness = lv_bar_create(petPanel);
+  lv_obj_set_size(uiBarPetHappiness, 126, 10);
+  lv_obj_align(uiBarPetHappiness, LV_ALIGN_TOP_RIGHT, -4, 70);
+  lv_bar_set_range(uiBarPetHappiness, 0, 100);
+  lv_obj_set_style_bg_color(uiBarPetHappiness, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiBarPetHappiness, lv_color_hex(0xCA8A04), LV_PART_INDICATOR);
+
+  lv_obj_t* petLabelHealth = lv_label_create(petPanel);
+  lv_obj_align(petLabelHealth, LV_ALIGN_TOP_LEFT, 4, 86);
+  lv_label_set_text(petLabelHealth, "Health");
+  lv_obj_set_style_text_color(petLabelHealth, lv_color_hex(0x86EFAC), LV_PART_MAIN);
+
+  uiBarPetHealth = lv_bar_create(petPanel);
+  lv_obj_set_size(uiBarPetHealth, 126, 10);
+  lv_obj_align(uiBarPetHealth, LV_ALIGN_TOP_RIGHT, -4, 88);
+  lv_bar_set_range(uiBarPetHealth, 0, 100);
+  lv_obj_set_style_bg_color(uiBarPetHealth, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiBarPetHealth, lv_color_hex(0x16A34A), LV_PART_INDICATOR);
+
   lv_obj_t* petLabelEnergy = lv_label_create(petPanel);
-  lv_obj_align(petLabelEnergy, LV_ALIGN_TOP_LEFT, 4, 82);
+  lv_obj_align(petLabelEnergy, LV_ALIGN_TOP_LEFT, 4, 104);
   lv_label_set_text(petLabelEnergy, "Energy");
   lv_obj_set_style_text_color(petLabelEnergy, lv_color_hex(0x93C5FD), LV_PART_MAIN);
 
   uiBarPetEnergy = lv_bar_create(petPanel);
-  lv_obj_set_size(uiBarPetEnergy, 126, 12);
-  lv_obj_align(uiBarPetEnergy, LV_ALIGN_TOP_RIGHT, -4, 84);
+  lv_obj_set_size(uiBarPetEnergy, 126, 10);
+  lv_obj_align(uiBarPetEnergy, LV_ALIGN_TOP_RIGHT, -4, 106);
   lv_bar_set_range(uiBarPetEnergy, 0, 100);
   lv_obj_set_style_bg_color(uiBarPetEnergy, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
   lv_obj_set_style_bg_color(uiBarPetEnergy, lv_color_hex(0x2563EB), LV_PART_INDICATOR);
 
-  lv_obj_t* petLabelMood = lv_label_create(petPanel);
-  lv_obj_align(petLabelMood, LV_ALIGN_TOP_LEFT, 4, 106);
-  lv_label_set_text(petLabelMood, "Mood");
-  lv_obj_set_style_text_color(petLabelMood, lv_color_hex(0xFDE68A), LV_PART_MAIN);
+  lv_obj_t* petLabelClean = lv_label_create(petPanel);
+  lv_obj_align(petLabelClean, LV_ALIGN_TOP_LEFT, 4, 122);
+  lv_label_set_text(petLabelClean, "Clean");
+  lv_obj_set_style_text_color(petLabelClean, lv_color_hex(0x67E8F9), LV_PART_MAIN);
 
-  uiBarPetMood = lv_bar_create(petPanel);
-  lv_obj_set_size(uiBarPetMood, 126, 12);
-  lv_obj_align(uiBarPetMood, LV_ALIGN_TOP_RIGHT, -4, 108);
-  lv_bar_set_range(uiBarPetMood, 0, 100);
-  lv_obj_set_style_bg_color(uiBarPetMood, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
-  lv_obj_set_style_bg_color(uiBarPetMood, lv_color_hex(0xCA8A04), LV_PART_INDICATOR);
+  uiBarPetCleanliness = lv_bar_create(petPanel);
+  lv_obj_set_size(uiBarPetCleanliness, 126, 10);
+  lv_obj_align(uiBarPetCleanliness, LV_ALIGN_TOP_RIGHT, -4, 124);
+  lv_bar_set_range(uiBarPetCleanliness, 0, 100);
+  lv_obj_set_style_bg_color(uiBarPetCleanliness, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiBarPetCleanliness, lv_color_hex(0x0891B2), LV_PART_INDICATOR);
+
+  uiLabelPetDetail = lv_label_create(petPanel);
+  lv_obj_set_width(uiLabelPetDetail, SCREEN_WIDTH - 40);
+  lv_obj_align(uiLabelPetDetail, LV_ALIGN_TOP_LEFT, 4, 140);
+  lv_label_set_long_mode(uiLabelPetDetail, LV_LABEL_LONG_DOT);
+  lv_label_set_text(uiLabelPetDetail, "Age 0m | Normal");
+  lv_obj_set_style_text_color(uiLabelPetDetail, lv_color_hex(0x9FB3CF), LV_PART_MAIN);
 
   lv_obj_t* btnPetFeed = lv_btn_create(petPanel);
-  lv_obj_set_size(btnPetFeed, 66, 32);
-  lv_obj_align(btnPetFeed, LV_ALIGN_BOTTOM_LEFT, 4, -34);
+  lv_obj_set_size(btnPetFeed, 66, 28);
+  lv_obj_align(btnPetFeed, LV_ALIGN_TOP_LEFT, 4, 162);
   lv_obj_set_style_radius(btnPetFeed, 8, LV_PART_MAIN);
   lv_obj_set_style_bg_color(btnPetFeed, lv_color_hex(0x0F766E), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(btnPetFeed, LV_OPA_COVER, LV_PART_MAIN);
@@ -5025,8 +5671,8 @@ void buildUi() {
   lv_obj_center(petFeedLabel);
 
   lv_obj_t* btnPetPlay = lv_btn_create(petPanel);
-  lv_obj_set_size(btnPetPlay, 66, 32);
-  lv_obj_align(btnPetPlay, LV_ALIGN_BOTTOM_MID, 0, -34);
+  lv_obj_set_size(btnPetPlay, 66, 28);
+  lv_obj_align(btnPetPlay, LV_ALIGN_TOP_LEFT, 79, 162);
   lv_obj_set_style_radius(btnPetPlay, 8, LV_PART_MAIN);
   lv_obj_set_style_bg_color(btnPetPlay, lv_color_hex(0x1D4ED8), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(btnPetPlay, LV_OPA_COVER, LV_PART_MAIN);
@@ -5035,30 +5681,58 @@ void buildUi() {
   lv_label_set_text(petPlayLabel, "Play");
   lv_obj_center(petPlayLabel);
 
-  lv_obj_t* btnPetRest = lv_btn_create(petPanel);
-  lv_obj_set_size(btnPetRest, 66, 32);
-  lv_obj_align(btnPetRest, LV_ALIGN_BOTTOM_RIGHT, -4, -34);
-  lv_obj_set_style_radius(btnPetRest, 8, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(btnPetRest, lv_color_hex(0x475569), LV_PART_MAIN);
-  lv_obj_set_style_bg_opa(btnPetRest, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_add_event_cb(btnPetRest, uiPocketPetRestButtonEventCb, LV_EVENT_CLICKED, nullptr);
-  uiLabelPetRestButton = lv_label_create(btnPetRest);
-  lv_label_set_text(uiLabelPetRestButton, "Rest");
-  lv_obj_center(uiLabelPetRestButton);
+  lv_obj_t* btnPetClean = lv_btn_create(petPanel);
+  lv_obj_set_size(btnPetClean, 66, 28);
+  lv_obj_align(btnPetClean, LV_ALIGN_TOP_LEFT, 154, 162);
+  lv_obj_set_style_radius(btnPetClean, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(btnPetClean, lv_color_hex(0x0E7490), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(btnPetClean, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_event_cb(btnPetClean, uiPocketPetCleanButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* petCleanLabel = lv_label_create(btnPetClean);
+  lv_label_set_text(petCleanLabel, "Clean");
+  lv_obj_center(petCleanLabel);
 
-  uiLabelPetStatus = lv_label_create(petPanel);
-  lv_obj_align(uiLabelPetStatus, LV_ALIGN_BOTTOM_MID, 0, -8);
-  lv_label_set_text(uiLabelPetStatus, "H30%  E82%  M76%");
-  lv_obj_set_style_text_color(uiLabelPetStatus, lv_color_hex(0x9FB3CF), LV_PART_MAIN);
+  lv_obj_t* btnPetSleep = lv_btn_create(petPanel);
+  lv_obj_set_size(btnPetSleep, 66, 28);
+  lv_obj_align(btnPetSleep, LV_ALIGN_TOP_LEFT, 4, 194);
+  lv_obj_set_style_radius(btnPetSleep, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(btnPetSleep, lv_color_hex(0x6D28D9), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(btnPetSleep, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_event_cb(btnPetSleep, uiPocketPetSleepButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  uiLabelPetSleepButton = lv_label_create(btnPetSleep);
+  lv_label_set_text(uiLabelPetSleepButton, "Sleep");
+  lv_obj_center(uiLabelPetSleepButton);
+
+  lv_obj_t* btnPetHeal = lv_btn_create(petPanel);
+  lv_obj_set_size(btnPetHeal, 66, 28);
+  lv_obj_align(btnPetHeal, LV_ALIGN_TOP_LEFT, 79, 194);
+  lv_obj_set_style_radius(btnPetHeal, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(btnPetHeal, lv_color_hex(0xBE185D), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(btnPetHeal, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_event_cb(btnPetHeal, uiPocketPetHealButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* petHealLabel = lv_label_create(btnPetHeal);
+  lv_label_set_text(petHealLabel, "Heal");
+  lv_obj_center(petHealLabel);
+
+  lv_obj_t* btnPetReset = lv_btn_create(petPanel);
+  lv_obj_set_size(btnPetReset, 66, 28);
+  lv_obj_align(btnPetReset, LV_ALIGN_TOP_LEFT, 154, 194);
+  lv_obj_set_style_radius(btnPetReset, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(btnPetReset, lv_color_hex(0x475569), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(btnPetReset, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_event_cb(btnPetReset, uiPocketPetResetButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* petResetLabel = lv_label_create(btnPetReset);
+  lv_label_set_text(petResetLabel, "Reset");
+  lv_obj_center(petResetLabel);
 
   lv_obj_t* calTitle = lv_label_create(tabCalendar);
-  lv_obj_align(calTitle, LV_ALIGN_TOP_LEFT, 8, 10);
+  lv_obj_align(calTitle, LV_ALIGN_TOP_LEFT, 8, 38);
   lv_label_set_text(calTitle, "Daily Calendar");
   lv_obj_set_style_text_color(calTitle, lv_color_hex(0xFDE68A), LV_PART_MAIN);
 
   lv_obj_t* calSyncBtn = lv_btn_create(tabCalendar);
   lv_obj_set_size(calSyncBtn, 74, 30);
-  lv_obj_align(calSyncBtn, LV_ALIGN_TOP_RIGHT, -8, 6);
+  lv_obj_align(calSyncBtn, LV_ALIGN_TOP_RIGHT, -8, 34);
   lv_obj_set_style_radius(calSyncBtn, 8, LV_PART_MAIN);
   lv_obj_set_style_bg_color(calSyncBtn, lv_color_hex(0x14532D), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(calSyncBtn, LV_OPA_COVER, LV_PART_MAIN);
@@ -5069,7 +5743,7 @@ void buildUi() {
 
   uiListCalendar = lv_list_create(tabCalendar);
   lv_obj_set_size(uiListCalendar, SCREEN_WIDTH - 16, 230);
-  lv_obj_align(uiListCalendar, LV_ALIGN_TOP_MID, 0, 40);
+  lv_obj_align(uiListCalendar, LV_ALIGN_TOP_MID, 0, 68);
   lv_obj_set_style_radius(uiListCalendar, 10, LV_PART_MAIN);
   lv_obj_set_style_bg_color(uiListCalendar, lv_color_hex(0x101820), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(uiListCalendar, LV_OPA_COVER, LV_PART_MAIN);
@@ -5085,13 +5759,13 @@ void buildUi() {
   lv_obj_set_style_text_color(uiLabelCalendarStatus, lv_color_hex(0x9FB3CF), LV_PART_MAIN);
 
   lv_obj_t* syncTasksTitle = lv_label_create(tabSyncTasks);
-  lv_obj_align(syncTasksTitle, LV_ALIGN_TOP_LEFT, 8, 10);
+  lv_obj_align(syncTasksTitle, LV_ALIGN_TOP_LEFT, 8, 38);
   lv_label_set_text(syncTasksTitle, "Interactive Tasks");
   lv_obj_set_style_text_color(syncTasksTitle, lv_color_hex(0x7DD3FC), LV_PART_MAIN);
 
   lv_obj_t* syncTasksSyncBtn = lv_btn_create(tabSyncTasks);
   lv_obj_set_size(syncTasksSyncBtn, 74, 30);
-  lv_obj_align(syncTasksSyncBtn, LV_ALIGN_TOP_RIGHT, -8, 6);
+  lv_obj_align(syncTasksSyncBtn, LV_ALIGN_TOP_RIGHT, -8, 34);
   lv_obj_set_style_radius(syncTasksSyncBtn, 8, LV_PART_MAIN);
   lv_obj_set_style_bg_color(syncTasksSyncBtn, lv_color_hex(0x14532D), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(syncTasksSyncBtn, LV_OPA_COVER, LV_PART_MAIN);
@@ -5100,9 +5774,34 @@ void buildUi() {
   lv_label_set_text(syncTasksSyncLabel, "Sync");
   lv_obj_center(syncTasksSyncLabel);
 
+  lv_obj_t* todoListLabel = lv_label_create(tabSyncTasks);
+  lv_obj_align(todoListLabel, LV_ALIGN_TOP_LEFT, 8, 74);
+  lv_label_set_text(todoListLabel, "List");
+  lv_obj_set_style_text_color(todoListLabel, lv_color_hex(0x93C5FD), LV_PART_MAIN);
+
+  uiDdTodoEntity = lv_dropdown_create(tabSyncTasks);
+  lv_obj_set_width(uiDdTodoEntity, 150);
+  lv_obj_align(uiDdTodoEntity, LV_ALIGN_TOP_LEFT, 46, 68);
+  lv_obj_set_style_radius(uiDdTodoEntity, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiDdTodoEntity, lv_color_hex(0x10233C), LV_PART_MAIN);
+  lv_obj_set_style_text_color(uiDdTodoEntity, lv_color_hex(0xEAF2FF), LV_PART_MAIN);
+  lv_dropdown_set_options(uiDdTodoEntity, activeTodoEntity().c_str());
+  lv_obj_add_event_cb(uiDdTodoEntity, uiTodoEntityDropdownEventCb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  lv_obj_t* todoListsRefreshBtn = lv_btn_create(tabSyncTasks);
+  lv_obj_set_size(todoListsRefreshBtn, 64, 30);
+  lv_obj_align(todoListsRefreshBtn, LV_ALIGN_TOP_RIGHT, -8, 68);
+  lv_obj_set_style_radius(todoListsRefreshBtn, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(todoListsRefreshBtn, lv_color_hex(0x1E40AF), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(todoListsRefreshBtn, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_event_cb(todoListsRefreshBtn, uiTodoEntityRefreshButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* todoListsRefreshLabel = lv_label_create(todoListsRefreshBtn);
+  lv_label_set_text(todoListsRefreshLabel, "Lists");
+  lv_obj_center(todoListsRefreshLabel);
+
   uiListSyncTasks = lv_list_create(tabSyncTasks);
-  lv_obj_set_size(uiListSyncTasks, SCREEN_WIDTH - 16, 230);
-  lv_obj_align(uiListSyncTasks, LV_ALIGN_TOP_MID, 0, 40);
+  lv_obj_set_size(uiListSyncTasks, SCREEN_WIDTH - 16, 188);
+  lv_obj_align(uiListSyncTasks, LV_ALIGN_TOP_MID, 0, 104);
   lv_obj_set_style_radius(uiListSyncTasks, 10, LV_PART_MAIN);
   lv_obj_set_style_bg_color(uiListSyncTasks, lv_color_hex(0x0F172A), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(uiListSyncTasks, LV_OPA_COVER, LV_PART_MAIN);
@@ -5135,6 +5834,7 @@ void buildUi() {
   uiRefreshTaskLog();
   uiSetCalendarStatus("Calendar idle");
   uiSetSyncTasksStatus("Task sync idle");
+  uiRefreshTodoEntityDropdown();
   uiRefreshCalendarList();
   uiRefreshSyncTasksList();
   uiUpdatePocketPet();
@@ -5395,6 +6095,7 @@ void setup() {
   lv_indev_drv_register(&indevDrv);
 
   loadWifiConfig();
+  loadPocketPetState();
   buildUi();
 
   Wire.begin(PIN_TOUCH_SDA, PIN_TOUCH_SCL, 400000);
@@ -5462,6 +6163,12 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     syncClockIfNeeded();
+    String todoErr;
+    if (fetchTodoEntityOptionsFromHomeAssistant(todoErr)) {
+      uiRefreshTodoEntityDropdown();
+    } else {
+      Serial.println(String("[TODO] list refresh: ") + todoErr);
+    }
     String syncErr;
     if (!syncCloudData(true, syncErr)) {
       Serial.println(String("[SYNC] initial sync skipped: ") + syncErr);
@@ -5495,6 +6202,17 @@ void loop() {
   if (wifiConnectRequested) {
     wifiConnectRequested = false;
     handleWifiConnect();
+  }
+
+  if (todoEntityRefreshRequested) {
+    todoEntityRefreshRequested = false;
+    String err;
+    if (fetchTodoEntityOptionsFromHomeAssistant(err)) {
+      uiRefreshTodoEntityDropdown();
+      uiSetSyncTasksStatus("To-do lists refreshed");
+    } else {
+      uiSetSyncTasksStatus("List refresh failed: " + clipText(err, 38));
+    }
   }
 
   if (captureRequested) {

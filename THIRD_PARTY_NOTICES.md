@@ -24,6 +24,10 @@ This project depends on third-party libraries/services and references vendor doc
    - Upstream: https://github.com/home-assistant/core
    - License: See upstream license and terms.
 
+6. ESP32-TamaPetchi (Pocket Pet behavior reference)
+   - Upstream: https://github.com/CyberXcyborg/ESP32-TamaPetchi
+   - License: MIT.
+
 ## Hardware Documentation and Community References
 
 The following external materials were used for board bring-up, pin mapping, and troubleshooting context. They are not redistributed by this repository and remain property of their respective owners:

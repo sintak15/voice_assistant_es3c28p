@@ -41,7 +41,7 @@
 #endif
 
 #ifndef HA_WAKE_PHRASE
-#define HA_WAKE_PHRASE "ok bob,okay bob,hey bob"
+#define HA_WAKE_PHRASE "ok bob,okay bob"
 #endif
 
 #ifndef ASSISTANT_ENABLE_HANDS_FREE
@@ -54,4 +54,47 @@
 
 #ifndef ASSISTANT_VAD_TRIGGER_FRAMES
 #define ASSISTANT_VAD_TRIGGER_FRAMES 3
+#endif
+
+// Cloud dashboard integration (Google Calendar/Tasks or any compatible JSON endpoint)
+// Calendar endpoint should return an array or an object with `items` containing:
+//   id, summary/title, start{dateTime|date}, end{dateTime|date}
+#ifndef CLOUD_CALENDAR_EVENTS_URL
+#define CLOUD_CALENDAR_EVENTS_URL ""
+#endif
+
+// Optional Home Assistant calendar entity fallback, e.g. "calendar.family"
+// If set, firmware calls:
+//   /api/calendars/<entity>?start=<utc>&end=<utc>
+#ifndef HA_CALENDAR_ENTITY_ID
+#define HA_CALENDAR_ENTITY_ID ""
+#endif
+
+// Tasks endpoint should return an array or an object with `items` containing:
+//   id, title/name/text, status/completed, due
+#ifndef CLOUD_TASKS_LIST_URL
+#define CLOUD_TASKS_LIST_URL ""
+#endif
+
+// Webhook/endpoint to mark task completion.
+// POST body: {id, title, completed, status}
+#ifndef CLOUD_TASK_COMPLETE_WEBHOOK_URL
+#define CLOUD_TASK_COMPLETE_WEBHOOK_URL ""
+#endif
+
+// Bearer token for cloud calendar/task APIs (if needed).
+// If empty, Home Assistant token is used for HA URLs.
+#ifndef CLOUD_API_BEARER_TOKEN
+#define CLOUD_API_BEARER_TOKEN ""
+#endif
+
+// Number of days ahead to request during each sync.
+#ifndef CLOUD_SYNC_DAYS_AHEAD
+#define CLOUD_SYNC_DAYS_AHEAD 3
+#endif
+
+// POSIX timezone string used by scheduled 6:00 AM sync and local-time rendering.
+// Change this to your locale if needed.
+#ifndef DEVICE_TZ
+#define DEVICE_TZ "CST6CDT,M3.2.0/2,M11.1.0/2"
 #endif

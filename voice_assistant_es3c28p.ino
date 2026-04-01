@@ -14,6 +14,8 @@
 #include <ctype.h>
 #include <cstring>
 #include <math.h>
+#include <new>
+#include <time.h>
 
 #include "board_pins.h"
 #include "es8311_codec.h"
@@ -34,8 +36,13 @@ enum class AssistantState {
   Error
 };
 
-static const uint16_t SCREEN_WIDTH = 320;
-static const uint16_t SCREEN_HEIGHT = 240;
+enum class CaptureMode {
+  Assistant,
+  Dictation
+};
+
+static const uint16_t SCREEN_WIDTH = 240;
+static const uint16_t SCREEN_HEIGHT = 320;
 static const uint32_t CAPTURE_SAMPLE_RATE = 16000;
 static const uint16_t CAPTURE_SECONDS = 3;
 static const size_t CAPTURE_SAMPLES = CAPTURE_SAMPLE_RATE * CAPTURE_SECONDS;
@@ -46,12 +53,61 @@ static const int PIN_ANALOG_MIC = -1;
 static const uint16_t STT_CONNECT_TIMEOUT_MS = 6000;
 static const uint16_t STT_IO_TIMEOUT_MS = 12000;
 static const uint8_t STT_MAX_RETRIES = 2;
+static const uint32_t MANUAL_CAPTURE_MAX_MS = 8000;
+static const uint32_t DICTATION_CAPTURE_MAX_MS = 5000;
+static const uint8_t DICTATION_END_SILENT_CHUNKS = 3;
+static const float DICTATION_SPEECH_START_RMS = 0.014f;
+static const float DICTATION_SPEECH_START_PEAK = 0.040f;
+static const float DICTATION_SILENCE_RMS = 0.009f;
+static const float DICTATION_SILENCE_PEAK = 0.028f;
 static const float TTS_OUTPUT_GAIN = 1.00f;
 static const size_t TTS_BUFFER_MAX_BYTES = 700 * 1024;
 static const uint32_t TTS_BUFFER_IDLE_TIMEOUT_MS = 300;
 static const size_t TTS_STREAM_PREFETCH_BYTES = 12 * 1024;
 static const uint32_t TTS_STREAM_PREFETCH_MAX_MS = 240;
 static const uint32_t TTS_STREAM_PREFETCH_IDLE_MS = 90;
+static const size_t NOTES_MAX_CHARS = 6000;
+static const size_t MAX_TASK_ITEMS = 24;
+static const uint16_t TAB_INDEX_HOME = 0;
+static const uint16_t TAB_INDEX_CONFIG = 1;
+static const uint16_t TAB_INDEX_NOTES = 2;
+static const uint16_t TAB_INDEX_TASKS = 3;
+static const uint16_t TAB_INDEX_POCKET_PET = 4;
+static const uint16_t TAB_INDEX_CALENDAR = 5;
+static const uint16_t TAB_INDEX_SYNC_TASKS = 6;
+static const uint16_t TAB_COUNT = 7;
+static const size_t MAX_CALENDAR_EVENTS = 20;
+static const size_t MAX_SYNC_TASKS = 24;
+static const uint16_t CALENDAR_ALERT_LEAD_MINUTES = 10;
+static const uint32_t CLOUD_SYNC_RETRY_MS = 5UL * 60UL * 1000UL;
+
+#ifndef CLOUD_CALENDAR_EVENTS_URL
+#define CLOUD_CALENDAR_EVENTS_URL ""
+#endif
+
+#ifndef CLOUD_TASKS_LIST_URL
+#define CLOUD_TASKS_LIST_URL ""
+#endif
+
+#ifndef CLOUD_TASK_COMPLETE_WEBHOOK_URL
+#define CLOUD_TASK_COMPLETE_WEBHOOK_URL ""
+#endif
+
+#ifndef CLOUD_API_BEARER_TOKEN
+#define CLOUD_API_BEARER_TOKEN ""
+#endif
+
+#ifndef CLOUD_SYNC_DAYS_AHEAD
+#define CLOUD_SYNC_DAYS_AHEAD 3
+#endif
+
+#ifndef HA_CALENDAR_ENTITY_ID
+#define HA_CALENDAR_ENTITY_ID ""
+#endif
+
+#ifndef DEVICE_TZ
+#define DEVICE_TZ "CST6CDT,M3.2.0/2,M11.1.0/2"
+#endif
 
 static TFT_eSPI tft = TFT_eSPI(SCREEN_WIDTH, SCREEN_HEIGHT);
 static lv_disp_draw_buf_t drawBuf;
@@ -83,6 +139,8 @@ bool wifiSaveRequested = false;
 bool wifiConnectRequested = false;
 bool assistantStopRequested = false;
 bool bypassWakeWordForNextCapture = false;
+CaptureMode pendingCaptureMode = CaptureMode::Assistant;
+CaptureMode activeCaptureMode = CaptureMode::Assistant;
 uint8_t vadActiveFrames = 0;
 uint32_t lastVadPollMs = 0;
 uint32_t lastVadDebugMs = 0;
@@ -108,8 +166,13 @@ uint32_t captureIndex = 0;
 lv_obj_t* uiTabview = nullptr;
 lv_obj_t* uiLabelState = nullptr;
 lv_obj_t* uiLabelDetail = nullptr;
+lv_obj_t* uiLabelHint = nullptr;
 lv_obj_t* uiLabelWifi = nullptr;
 lv_obj_t* uiLabelMic = nullptr;
+lv_obj_t* uiIconState = nullptr;
+lv_obj_t* uiIconWifi = nullptr;
+lv_obj_t* uiIconSd = nullptr;
+lv_obj_t* uiIconMic = nullptr;
 lv_obj_t* uiBtnTalk = nullptr;
 lv_obj_t* uiLabelTalk = nullptr;
 
@@ -118,6 +181,87 @@ lv_obj_t* uiTaSsid = nullptr;
 lv_obj_t* uiTaPassword = nullptr;
 lv_obj_t* uiLabelWifiMenuStatus = nullptr;
 lv_obj_t* uiKeyboard = nullptr;
+
+lv_obj_t* uiTaNotes = nullptr;
+lv_obj_t* uiBtnDictate = nullptr;
+lv_obj_t* uiLabelDictate = nullptr;
+lv_obj_t* uiBtnNotesDictate = nullptr;
+lv_obj_t* uiLabelNotesDictate = nullptr;
+lv_obj_t* uiBtnClearNotes = nullptr;
+lv_obj_t* uiLabelNotesStatus = nullptr;
+lv_obj_t* uiBtnOpenNotes = nullptr;
+lv_obj_t* uiBtnOpenConfig = nullptr;
+lv_obj_t* uiTaTaskInput = nullptr;
+lv_obj_t* uiTaTaskLog = nullptr;
+lv_obj_t* uiLabelTaskStatus = nullptr;
+lv_obj_t* uiBtnTaskQueue = nullptr;
+lv_obj_t* uiBtnTaskRunNext = nullptr;
+lv_obj_t* uiBtnTaskRunAll = nullptr;
+lv_obj_t* uiBtnTaskClear = nullptr;
+lv_obj_t* uiBtnOpenTasks = nullptr;
+lv_obj_t* uiBtnOpenPet = nullptr;
+lv_obj_t* uiLabelPetFace = nullptr;
+lv_obj_t* uiLabelPetSummary = nullptr;
+lv_obj_t* uiLabelPetStatus = nullptr;
+lv_obj_t* uiBarPetHunger = nullptr;
+lv_obj_t* uiBarPetEnergy = nullptr;
+lv_obj_t* uiBarPetMood = nullptr;
+lv_obj_t* uiLabelPetRestButton = nullptr;
+lv_obj_t* uiBtnOpenCalendar = nullptr;
+lv_obj_t* uiBtnOpenSyncTasks = nullptr;
+lv_obj_t* uiListCalendar = nullptr;
+lv_obj_t* uiLabelCalendarStatus = nullptr;
+lv_obj_t* uiListSyncTasks = nullptr;
+lv_obj_t* uiLabelSyncTasksStatus = nullptr;
+
+String notesText;
+
+struct TaskItem {
+  String command;
+  String result;
+  bool completed = false;
+  bool success = false;
+};
+
+TaskItem taskQueue[MAX_TASK_ITEMS];
+size_t taskCount = 0;
+
+struct PocketPetState {
+  uint8_t hunger = 30;      // 0 = full, 100 = very hungry
+  uint8_t energy = 82;      // 0 = exhausted, 100 = fully rested
+  uint8_t mood = 76;        // 0 = upset, 100 = very happy
+  bool resting = false;
+  uint32_t lastTickMs = 0;
+};
+
+PocketPetState pocketPet;
+
+struct CalendarEventItem {
+  String id;
+  String title;
+  String startLabel;
+  String endLabel;
+  time_t startEpoch = 0;
+  time_t endEpoch = 0;
+  bool alerted = false;
+};
+
+struct SyncedTaskItem {
+  String id;
+  String title;
+  String dueLabel;
+  bool completed = false;
+};
+
+CalendarEventItem calendarEvents[MAX_CALENDAR_EVENTS];
+size_t calendarEventCount = 0;
+SyncedTaskItem syncedTasks[MAX_SYNC_TASKS];
+size_t syncedTaskCount = 0;
+
+bool cloudSyncRequested = false;
+bool cloudDataLoadedFromCache = false;
+uint32_t lastCloudSyncAttemptMs = 0;
+int32_t lastCloudSyncDayKey = -1;
 
 String clipText(const String& in, size_t maxLen) {
   if (in.length() <= maxLen) {
@@ -146,13 +290,53 @@ const char* stateName(AssistantState s) {
   return "Unknown";
 }
 
+lv_color_t uiStateColor(AssistantState s) {
+  switch (s) {
+    case AssistantState::Booting:
+      return lv_color_hex(0x93C5FD);
+    case AssistantState::ConnectingWiFi:
+      return lv_color_hex(0x60A5FA);
+    case AssistantState::Idle:
+      return lv_color_hex(0x34D399);
+    case AssistantState::Listening:
+      return lv_color_hex(0xFBBF24);
+    case AssistantState::Thinking:
+      return lv_color_hex(0xC4B5FD);
+    case AssistantState::Speaking:
+      return lv_color_hex(0x2DD4BF);
+    case AssistantState::Error:
+      return lv_color_hex(0xF87171);
+  }
+  return lv_color_hex(0xEAF2FF);
+}
+
+const char* uiStateHint(AssistantState s) {
+  switch (s) {
+    case AssistantState::Booting:
+      return "Starting hardware and services";
+    case AssistantState::ConnectingWiFi:
+      return "Joining network, please wait";
+    case AssistantState::Idle:
+      return "Queue commands, then run Next/All in Tasks";
+    case AssistantState::Listening:
+      return "Speak naturally; tap Stop to cancel";
+    case AssistantState::Thinking:
+      return "Transcribing and preparing a response";
+    case AssistantState::Speaking:
+      return "Playing assistant reply";
+    case AssistantState::Error:
+      return "Check detail text for the last failure";
+  }
+  return "";
+}
+
 TouchPoint mapTouchToRotation1(const TouchPoint& raw) {
-  const int mappedX = raw.y;
-  const int mappedY = 239 - static_cast<int>(raw.x);
+  const int mappedX = raw.x;
+  const int mappedY = raw.y;
 
   TouchPoint mapped = {
-      static_cast<uint16_t>(mappedX < 0 ? 0 : (mappedX > 319 ? 319 : mappedX)),
-      static_cast<uint16_t>(mappedY < 0 ? 0 : (mappedY > 239 ? 239 : mappedY)),
+      static_cast<uint16_t>(mappedX < 0 ? 0 : (mappedX > (SCREEN_WIDTH - 1) ? (SCREEN_WIDTH - 1) : mappedX)),
+      static_cast<uint16_t>(mappedY < 0 ? 0 : (mappedY > (SCREEN_HEIGHT - 1) ? (SCREEN_HEIGHT - 1) : mappedY)),
   };
 
   return mapped;
@@ -168,6 +352,28 @@ void handleWifiConnect();
 void uiShowKeyboardFor(lv_obj_t* ta);
 void uiHideKeyboard();
 void uiUpdateTalkButtonLabel();
+void uiUpdateDictateButtonLabel();
+void uiSetNotesStatus(const String& text);
+void uiAppendDictationNote(const String& text);
+void uiSetTaskStatus(const String& text);
+void uiSetCalendarStatus(const String& text);
+void uiSetSyncTasksStatus(const String& text);
+void uiRefreshTaskLog();
+void uiRefreshCalendarList();
+void uiRefreshSyncTasksList();
+bool queueTaskCommand(const String& text);
+bool runNextQueuedTask();
+void runAllQueuedTasks();
+void uiUpdatePocketPet();
+void updatePocketPetLoop(uint32_t nowMs);
+bool syncCloudData(bool force, String& outError);
+bool loadCloudCache(String& outError);
+bool saveCloudCache(String& outError);
+void maybeRunScheduledCloudSync(uint32_t nowMs);
+void checkCalendarAlerts(uint32_t nowMs);
+bool playAlertChime();
+void syncClockIfNeeded();
+void requestCapture(CaptureMode mode, bool bypassWakeWord);
 bool homeAssistantTtsGetUrl(const String& text, String& outUrl, String& outError);
 bool homeAssistantPlayTtsWav(const String& ttsUrl, String& outError);
 
@@ -181,6 +387,24 @@ void uiWifiConnectButtonEventCb(lv_event_t* e);
 void uiWifiDropdownEventCb(lv_event_t* e);
 void uiTextareaEventCb(lv_event_t* e);
 void uiKeyboardEventCb(lv_event_t* e);
+void uiDictateButtonEventCb(lv_event_t* e);
+void uiClearNotesButtonEventCb(lv_event_t* e);
+void uiOpenNotesButtonEventCb(lv_event_t* e);
+void uiOpenConfigButtonEventCb(lv_event_t* e);
+void uiOpenTasksButtonEventCb(lv_event_t* e);
+void uiOpenPocketPetButtonEventCb(lv_event_t* e);
+void uiOpenCalendarButtonEventCb(lv_event_t* e);
+void uiOpenSyncTasksButtonEventCb(lv_event_t* e);
+void uiCloudSyncButtonEventCb(lv_event_t* e);
+void uiSyncedTaskToggleEventCb(lv_event_t* e);
+void uiTaskQueueButtonEventCb(lv_event_t* e);
+void uiTaskRunNextButtonEventCb(lv_event_t* e);
+void uiTaskRunAllButtonEventCb(lv_event_t* e);
+void uiTaskClearButtonEventCb(lv_event_t* e);
+void uiPocketPetExitButtonEventCb(lv_event_t* e);
+void uiPocketPetFeedButtonEventCb(lv_event_t* e);
+void uiPocketPetPlayButtonEventCb(lv_event_t* e);
+void uiPocketPetRestButtonEventCb(lv_event_t* e);
 
 void setState(AssistantState nextState, const String& detail) {
   state = nextState;
@@ -193,6 +417,7 @@ void setState(AssistantState nextState, const String& detail) {
 
   uiUpdateStatus();
   uiUpdateTalkButtonLabel();
+  uiUpdateDictateButtonLabel();
 }
 
 void uiRefreshNow() {
@@ -210,24 +435,266 @@ void uiSetWifiMenuStatus(const String& text) {
   lv_label_set_text(uiLabelWifiMenuStatus, clipText(text, 80).c_str());
 }
 
+void uiSetNotesStatus(const String& text) {
+  if (!uiLabelNotesStatus) {
+    return;
+  }
+  lv_label_set_text(uiLabelNotesStatus, clipText(text, 88).c_str());
+}
+
+void uiSetTaskStatus(const String& text) {
+  if (!uiLabelTaskStatus) {
+    return;
+  }
+  lv_label_set_text(uiLabelTaskStatus, clipText(text, 88).c_str());
+}
+
+void uiSetCalendarStatus(const String& text) {
+  if (!uiLabelCalendarStatus) {
+    return;
+  }
+  lv_label_set_text(uiLabelCalendarStatus, clipText(text, 90).c_str());
+}
+
+void uiSetSyncTasksStatus(const String& text) {
+  if (!uiLabelSyncTasksStatus) {
+    return;
+  }
+  lv_label_set_text(uiLabelSyncTasksStatus, clipText(text, 90).c_str());
+}
+
+static uint8_t clampPercentInt(int value) {
+  if (value < 0) {
+    return 0;
+  }
+  if (value > 100) {
+    return 100;
+  }
+  return static_cast<uint8_t>(value);
+}
+
+void uiUpdatePocketPet() {
+  if (!uiLabelPetFace && !uiBarPetHunger && !uiBarPetEnergy && !uiBarPetMood && !uiLabelPetStatus) {
+    return;
+  }
+
+  const bool hungry = pocketPet.hunger >= 72;
+  const bool tired = pocketPet.energy <= 34;
+  const bool lowMood = pocketPet.mood <= 36;
+
+  const char* face = "(^_^)";
+  String summary = "Happy and alert";
+  if (pocketPet.resting) {
+    face = "(-_-) zZ";
+    summary = "Resting";
+  } else if (hungry && tired) {
+    face = "(x_x)";
+    summary = "Needs food and rest";
+  } else if (hungry) {
+    face = "(o_o)";
+    summary = "Hungry";
+  } else if (tired) {
+    face = "(u_u)";
+    summary = "Low energy";
+  } else if (lowMood) {
+    face = "(._.)";
+    summary = "Needs attention";
+  }
+
+  if (uiLabelPetFace) {
+    lv_label_set_text(uiLabelPetFace, face);
+  }
+  if (uiLabelPetSummary) {
+    lv_label_set_text(uiLabelPetSummary, summary.c_str());
+    lv_obj_set_style_text_color(uiLabelPetSummary, lowMood ? lv_color_hex(0xFCA5A5) : lv_color_hex(0x93C5FD), LV_PART_MAIN);
+  }
+  if (uiBarPetHunger) {
+    lv_bar_set_value(uiBarPetHunger, pocketPet.hunger, LV_ANIM_ON);
+  }
+  if (uiBarPetEnergy) {
+    lv_bar_set_value(uiBarPetEnergy, pocketPet.energy, LV_ANIM_ON);
+  }
+  if (uiBarPetMood) {
+    lv_bar_set_value(uiBarPetMood, pocketPet.mood, LV_ANIM_ON);
+  }
+  if (uiLabelPetStatus) {
+    String status = String("H") + String(static_cast<int>(pocketPet.hunger)) +
+                    "%  E" + String(static_cast<int>(pocketPet.energy)) +
+                    "%  M" + String(static_cast<int>(pocketPet.mood)) + "%";
+    lv_label_set_text(uiLabelPetStatus, status.c_str());
+  }
+  if (uiLabelPetRestButton) {
+    lv_label_set_text(uiLabelPetRestButton, pocketPet.resting ? "Wake" : "Rest");
+  }
+}
+
+void updatePocketPetLoop(uint32_t nowMs) {
+  if (pocketPet.lastTickMs == 0) {
+    pocketPet.lastTickMs = nowMs;
+    uiUpdatePocketPet();
+    return;
+  }
+
+  if (nowMs <= pocketPet.lastTickMs) {
+    return;
+  }
+
+  const uint32_t elapsedMs = nowMs - pocketPet.lastTickMs;
+  if (elapsedMs < 1000) {
+    return;
+  }
+  pocketPet.lastTickMs = nowMs;
+
+  const uint32_t ticks = elapsedMs / 1000;
+  for (uint32_t i = 0; i < ticks; i++) {
+    if (pocketPet.resting) {
+      pocketPet.energy = clampPercentInt(static_cast<int>(pocketPet.energy) + 2);
+      pocketPet.hunger = clampPercentInt(static_cast<int>(pocketPet.hunger) + 1);
+      pocketPet.mood = clampPercentInt(static_cast<int>(pocketPet.mood) + (pocketPet.energy >= 80 ? 1 : 0));
+    } else {
+      pocketPet.hunger = clampPercentInt(static_cast<int>(pocketPet.hunger) + 1);
+      pocketPet.energy = clampPercentInt(static_cast<int>(pocketPet.energy) - 1);
+      if (pocketPet.hunger > 75 || pocketPet.energy < 25) {
+        pocketPet.mood = clampPercentInt(static_cast<int>(pocketPet.mood) - 2);
+      } else if (pocketPet.hunger < 45 && pocketPet.energy > 55) {
+        pocketPet.mood = clampPercentInt(static_cast<int>(pocketPet.mood) + 1);
+      }
+    }
+  }
+
+  uiUpdatePocketPet();
+}
+
+void uiAppendDictationNote(const String& text) {
+  String cleaned = text;
+  cleaned.trim();
+  if (cleaned.length() == 0) {
+    return;
+  }
+
+  if (notesText.length() > 0 && !notesText.endsWith("\n")) {
+    notesText += "\n";
+  }
+  notesText += cleaned;
+  notesText += "\n";
+
+  if (notesText.length() > NOTES_MAX_CHARS) {
+    const int overflow = static_cast<int>(notesText.length() - NOTES_MAX_CHARS);
+    notesText.remove(0, overflow);
+    const int firstBreak = notesText.indexOf('\n');
+    if (firstBreak >= 0) {
+      notesText.remove(0, firstBreak + 1);
+    }
+  }
+
+  if (uiTaNotes) {
+    lv_textarea_set_text(uiTaNotes, notesText.c_str());
+    lv_textarea_set_cursor_pos(uiTaNotes, LV_TEXTAREA_CURSOR_LAST);
+  }
+}
+
+void requestCapture(CaptureMode mode, bool bypassWakeWord) {
+  assistantStopRequested = false;
+  pendingCaptureMode = mode;
+  bypassWakeWordForNextCapture = bypassWakeWord;
+  captureRequested = true;
+}
+
 void uiSetTalkEnabled(bool enabled) {
   if (!uiBtnTalk) {
     return;
   }
   if (enabled) {
     lv_obj_clear_state(uiBtnTalk, LV_STATE_DISABLED);
+    if (uiBtnDictate) {
+      lv_obj_clear_state(uiBtnDictate, LV_STATE_DISABLED);
+    }
+    if (uiBtnNotesDictate) {
+      lv_obj_clear_state(uiBtnNotesDictate, LV_STATE_DISABLED);
+    }
   } else {
     lv_obj_add_state(uiBtnTalk, LV_STATE_DISABLED);
+    if (uiBtnDictate) {
+      lv_obj_add_state(uiBtnDictate, LV_STATE_DISABLED);
+    }
+    if (uiBtnNotesDictate) {
+      lv_obj_add_state(uiBtnNotesDictate, LV_STATE_DISABLED);
+    }
   }
 }
 
 void uiUpdateTalkButtonLabel() {
-  if (!uiLabelTalk) {
+  if (!uiLabelTalk || !uiBtnTalk) {
     return;
   }
+
   const bool busy = state != AssistantState::Idle;
-  lv_label_set_text(uiLabelTalk, busy ? "Stop" : "Listen");
+  const bool assistantActive = busy && activeCaptureMode == CaptureMode::Assistant;
+  const bool disabled = lv_obj_has_state(uiBtnTalk, LV_STATE_DISABLED);
+  if (assistantActive) {
+    lv_label_set_text(uiLabelTalk, LV_SYMBOL_STOP " Stop");
+  } else {
+    lv_label_set_text(uiLabelTalk, LV_SYMBOL_AUDIO " Listen");
+  }
+  lv_obj_set_style_text_align(uiLabelTalk, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
   lv_obj_center(uiLabelTalk);
+
+  lv_color_t btnColor = assistantActive ? lv_color_hex(0x2A1111) : lv_color_hex(0x161616);
+  lv_color_t borderColor = assistantActive ? lv_color_hex(0xF87171) : lv_color_hex(0x00FF88);
+  if (disabled) {
+    btnColor = lv_color_hex(0x101010);
+    borderColor = lv_color_hex(0x4B5563);
+  }
+
+  lv_obj_set_style_bg_color(uiBtnTalk, btnColor, LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(uiBtnTalk, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(uiBtnTalk, assistantActive ? 2 : 1, LV_PART_MAIN);
+  lv_obj_set_style_border_color(uiBtnTalk, borderColor, LV_PART_MAIN);
+  lv_obj_set_style_radius(uiBtnTalk, 8, LV_PART_MAIN);
+  lv_obj_set_style_shadow_width(uiBtnTalk, 0, LV_PART_MAIN);
+  lv_obj_set_style_text_color(uiLabelTalk, disabled ? lv_color_hex(0x6B7280) : borderColor, LV_PART_MAIN);
+}
+
+void uiUpdateDictateButtonLabel() {
+  if (!uiLabelDictate || !uiBtnDictate) {
+    return;
+  }
+
+  const bool busy = state != AssistantState::Idle;
+  const bool dictationActive = busy && activeCaptureMode == CaptureMode::Dictation;
+  const bool disabled = lv_obj_has_state(uiBtnDictate, LV_STATE_DISABLED);
+  if (dictationActive) {
+    lv_label_set_text(uiLabelDictate, LV_SYMBOL_STOP " Stop");
+  } else {
+    lv_label_set_text(uiLabelDictate, LV_SYMBOL_EDIT " Dictate");
+  }
+  lv_obj_set_style_text_align(uiLabelDictate, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_center(uiLabelDictate);
+
+  lv_color_t btnColor = dictationActive ? lv_color_hex(0x2A1111) : lv_color_hex(0x161616);
+  lv_color_t borderColor = dictationActive ? lv_color_hex(0xF87171) : lv_color_hex(0x60A5FA);
+  if (disabled) {
+    btnColor = lv_color_hex(0x101010);
+    borderColor = lv_color_hex(0x4B5563);
+  }
+
+  lv_obj_set_style_bg_color(uiBtnDictate, btnColor, LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(uiBtnDictate, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(uiBtnDictate, dictationActive ? 2 : 1, LV_PART_MAIN);
+  lv_obj_set_style_border_color(uiBtnDictate, borderColor, LV_PART_MAIN);
+  lv_obj_set_style_radius(uiBtnDictate, 8, LV_PART_MAIN);
+  lv_obj_set_style_shadow_width(uiBtnDictate, 0, LV_PART_MAIN);
+  lv_obj_set_style_text_color(uiLabelDictate, disabled ? lv_color_hex(0x6B7280) : borderColor, LV_PART_MAIN);
+
+  if (uiLabelNotesDictate && uiBtnNotesDictate) {
+    lv_label_set_text(uiLabelNotesDictate, dictationActive ? "Stop" : "Dictate");
+    lv_obj_center(uiLabelNotesDictate);
+    lv_obj_set_style_bg_color(uiBtnNotesDictate, dictationActive ? lv_color_hex(0x2A1111) : lv_color_hex(0x111827), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(uiBtnNotesDictate, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(uiBtnNotesDictate, 12, LV_PART_MAIN);
+    lv_obj_set_style_border_width(uiBtnNotesDictate, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(uiBtnNotesDictate, dictationActive ? lv_color_hex(0xF87171) : lv_color_hex(0x60A5FA), LV_PART_MAIN);
+  }
 }
 
 void loadWifiConfig() {
@@ -259,8 +726,7 @@ void uiSyncWifiFields() {
 }
 
 bool isHomeAssistantConfigured() {
-  return strlen(HA_BASE_URL) > 0 && strlen(HA_ACCESS_TOKEN) > 0 &&
-         strlen(HA_STT_PROVIDER) > 0;
+  return strlen(HA_BASE_URL) > 0 && strlen(HA_ACCESS_TOKEN) > 0;
 }
 
 String joinedUrl(const char* base, const String& path) {
@@ -328,7 +794,8 @@ bool transcriptHasWakePhrase(const String& transcript, String& outMatchedPhrase)
     return false;
   }
 
-  String configured = String(HA_WAKE_PHRASE);
+  // Always include primary wake phrases first, even if config drifts.
+  String configured = String("ok bob,okay bob,") + String(HA_WAKE_PHRASE);
   configured.replace('|', ',');
 
   int start = 0;
@@ -406,6 +873,888 @@ uint16_t urlPort(const String& url) {
     }
   }
   return url.startsWith("https://") ? 443 : 80;
+}
+
+String urlEncode(const String& input) {
+  String out;
+  out.reserve(input.length() * 3);
+  const char* hex = "0123456789ABCDEF";
+  for (size_t i = 0; i < input.length(); ++i) {
+    const uint8_t c = static_cast<uint8_t>(input[i]);
+    if ((c >= 'a' && c <= 'z') ||
+        (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') ||
+        c == '-' || c == '_' || c == '.' || c == '~') {
+      out += static_cast<char>(c);
+      continue;
+    }
+    out += '%';
+    out += hex[c >> 4];
+    out += hex[c & 0x0F];
+  }
+  return out;
+}
+
+String isoUtc(time_t epoch) {
+  struct tm tmUtc {};
+  gmtime_r(&epoch, &tmUtc);
+  char buf[24] = {0};
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tmUtc);
+  return String(buf);
+}
+
+String formatTimeLabel(time_t epoch, bool includeDate) {
+  if (epoch <= 0) {
+    return "";
+  }
+  struct tm tmLocal {};
+  localtime_r(&epoch, &tmLocal);
+  char buf[32] = {0};
+  strftime(buf, sizeof(buf), includeDate ? "%a %H:%M" : "%H:%M", &tmLocal);
+  return String(buf);
+}
+
+String formatDateLabel(time_t epoch) {
+  if (epoch <= 0) {
+    return "";
+  }
+  struct tm tmLocal {};
+  localtime_r(&epoch, &tmLocal);
+  char buf[40] = {0};
+  strftime(buf, sizeof(buf), "%a, %b %d", &tmLocal);
+  return String(buf);
+}
+
+time_t timegmCompat(const struct tm* value) {
+  if (!value) {
+    return 0;
+  }
+  struct tm tmp = *value;
+  const char* oldTz = getenv("TZ");
+  String oldTzValue = oldTz ? String(oldTz) : "";
+
+  setenv("TZ", "UTC0", 1);
+  tzset();
+  const time_t utc = mktime(&tmp);
+
+  if (oldTzValue.length() > 0) {
+    setenv("TZ", oldTzValue.c_str(), 1);
+  } else {
+    unsetenv("TZ");
+  }
+  tzset();
+  return utc;
+}
+
+bool parseIsoTimestamp(const String& value, time_t& outEpoch) {
+  outEpoch = 0;
+  String src = value;
+  src.trim();
+  if (src.length() < 10) {
+    return false;
+  }
+
+  int year = 0;
+  int month = 0;
+  int day = 0;
+  int hour = 0;
+  int minute = 0;
+  int second = 0;
+  int tzSign = 0;
+  int tzHour = 0;
+  int tzMinute = 0;
+  bool hasTime = src.indexOf('T') >= 0;
+  bool isZulu = src.endsWith("Z");
+  bool hasOffset = false;
+
+  if (!hasTime) {
+    if (sscanf(src.c_str(), "%d-%d-%d", &year, &month, &day) != 3) {
+      return false;
+    }
+  } else {
+    int dotPos = src.indexOf('.');
+    if (dotPos >= 0) {
+      int cutPos = dotPos + 1;
+      while (cutPos < src.length()) {
+        const char ch = src[cutPos];
+        if (ch == 'Z' || ch == '+' || ch == '-') {
+          break;
+        }
+        cutPos++;
+      }
+      src.remove(dotPos, cutPos - dotPos);
+    }
+
+    int tzPos = src.lastIndexOf('+');
+    int negPos = src.lastIndexOf('-');
+    const int tPos = src.indexOf('T');
+    if (negPos > tPos) {
+      tzPos = negPos;
+    }
+    if (tzPos > tPos) {
+      hasOffset = true;
+      const String offset = src.substring(tzPos);
+      src = src.substring(0, tzPos);
+      if (offset.length() >= 6) {
+        tzSign = offset[0] == '-' ? -1 : 1;
+        tzHour = offset.substring(1, 3).toInt();
+        tzMinute = offset.substring(4, 6).toInt();
+      }
+    } else if (src.endsWith("Z")) {
+      isZulu = true;
+      src.remove(src.length() - 1);
+    }
+
+    const int parts = sscanf(src.c_str(), "%d-%d-%dT%d:%d:%d", &year, &month, &day, &hour, &minute, &second);
+    if (parts < 5) {
+      return false;
+    }
+    if (parts == 5) {
+      second = 0;
+    }
+  }
+
+  struct tm tmValue {};
+  tmValue.tm_year = year - 1900;
+  tmValue.tm_mon = month - 1;
+  tmValue.tm_mday = day;
+  tmValue.tm_hour = hour;
+  tmValue.tm_min = minute;
+  tmValue.tm_sec = second;
+  tmValue.tm_isdst = -1;
+
+  if (!hasTime) {
+    outEpoch = mktime(&tmValue);
+    return outEpoch > 0;
+  }
+
+  if (isZulu || hasOffset) {
+    time_t utcBase = timegmCompat(&tmValue);
+    if (hasOffset) {
+      const int32_t offsetSeconds = (tzHour * 3600) + (tzMinute * 60);
+      utcBase -= (tzSign * offsetSeconds);
+    }
+    outEpoch = utcBase;
+    return outEpoch > 0;
+  }
+
+  outEpoch = mktime(&tmValue);
+  return outEpoch > 0;
+}
+
+int32_t localDayKey(time_t epoch) {
+  if (epoch <= 0) {
+    return -1;
+  }
+  struct tm tmLocal {};
+  localtime_r(&epoch, &tmLocal);
+  return (tmLocal.tm_year + 1900) * 1000 + tmLocal.tm_yday;
+}
+
+String cloudAuthTokenForUrl(const String& url) {
+  if (strlen(CLOUD_API_BEARER_TOKEN) > 0) {
+    return String(CLOUD_API_BEARER_TOKEN);
+  }
+  if (strlen(HA_ACCESS_TOKEN) > 0 && strlen(HA_BASE_URL) > 0) {
+    const String base = String(HA_BASE_URL);
+    if (url.startsWith(base)) {
+      return String(HA_ACCESS_TOKEN);
+    }
+  }
+  return "";
+}
+
+bool httpGetJsonWithAuth(const String& url, String& outBody, String& outError) {
+  outBody = "";
+  outError = "";
+  HTTPClient http;
+  WiFiClientSecure secureClient;
+  if (!beginHttp(http, secureClient, url)) {
+    outError = "HTTP begin failed";
+    return false;
+  }
+
+  http.setConnectTimeout(STT_CONNECT_TIMEOUT_MS);
+  http.setTimeout(STT_IO_TIMEOUT_MS);
+  http.addHeader("Accept", "application/json");
+  const String authToken = cloudAuthTokenForUrl(url);
+  if (authToken.length() > 0) {
+    http.addHeader("Authorization", String("Bearer ") + authToken);
+  }
+
+  const int code = http.GET();
+  if (code <= 0) {
+    outError = String("HTTP ") + code;
+    http.end();
+    return false;
+  }
+  outBody = http.getString();
+  http.end();
+  if (code < 200 || code >= 300) {
+    outError = String("HTTP ") + code;
+    return false;
+  }
+  return true;
+}
+
+bool httpPostJsonWithAuth(const String& url, const String& payload, String& outError) {
+  outError = "";
+  HTTPClient http;
+  WiFiClientSecure secureClient;
+  if (!beginHttp(http, secureClient, url)) {
+    outError = "HTTP begin failed";
+    return false;
+  }
+
+  http.setConnectTimeout(STT_CONNECT_TIMEOUT_MS);
+  http.setTimeout(STT_IO_TIMEOUT_MS);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Accept", "application/json");
+  const String authToken = cloudAuthTokenForUrl(url);
+  if (authToken.length() > 0) {
+    http.addHeader("Authorization", String("Bearer ") + authToken);
+  }
+
+  const int code = http.POST(payload);
+  if (code <= 0) {
+    outError = String("HTTP ") + code;
+    http.end();
+    return false;
+  }
+  http.end();
+  if (code < 200 || code >= 300) {
+    outError = String("HTTP ") + code;
+    return false;
+  }
+  return true;
+}
+
+void sortCalendarEvents() {
+  if (calendarEventCount < 2) {
+    return;
+  }
+  for (size_t i = 0; i < calendarEventCount - 1; ++i) {
+    for (size_t j = i + 1; j < calendarEventCount; ++j) {
+      if (calendarEvents[j].startEpoch < calendarEvents[i].startEpoch) {
+        CalendarEventItem tmp = calendarEvents[i];
+        calendarEvents[i] = calendarEvents[j];
+        calendarEvents[j] = tmp;
+      }
+    }
+  }
+}
+
+void sortSyncedTasks() {
+  if (syncedTaskCount < 2) {
+    return;
+  }
+  for (size_t i = 0; i < syncedTaskCount - 1; ++i) {
+    for (size_t j = i + 1; j < syncedTaskCount; ++j) {
+      if (syncedTasks[i].completed != syncedTasks[j].completed) {
+        if (syncedTasks[i].completed) {
+          SyncedTaskItem tmp = syncedTasks[i];
+          syncedTasks[i] = syncedTasks[j];
+          syncedTasks[j] = tmp;
+        }
+      }
+    }
+  }
+}
+
+String jsonStringOrEmpty(JsonVariantConst v) {
+  if (v.is<const char*>()) {
+    return String(v.as<const char*>());
+  }
+  if (v.is<String>()) {
+    return v.as<String>();
+  }
+  return "";
+}
+
+bool parseCalendarPayload(const String& payload, String& outError) {
+  outError = "";
+  DynamicJsonDocument doc(24576);
+  const auto jsonErr = deserializeJson(doc, payload);
+  if (jsonErr) {
+    outError = "Calendar JSON parse failed";
+    return false;
+  }
+
+  JsonArray arr;
+  if (doc.is<JsonArray>()) {
+    arr = doc.as<JsonArray>();
+  } else if (doc["items"].is<JsonArray>()) {
+    arr = doc["items"].as<JsonArray>();
+  } else if (doc["events"].is<JsonArray>()) {
+    arr = doc["events"].as<JsonArray>();
+  } else {
+    outError = "Calendar payload missing array";
+    return false;
+  }
+
+  calendarEventCount = 0;
+  for (JsonVariantConst item : arr) {
+    if (calendarEventCount >= MAX_CALENDAR_EVENTS) {
+      break;
+    }
+
+    String title = jsonStringOrEmpty(item["summary"]);
+    if (title.length() == 0) {
+      title = jsonStringOrEmpty(item["title"]);
+    }
+    if (title.length() == 0) {
+      title = jsonStringOrEmpty(item["name"]);
+    }
+    if (title.length() == 0) {
+      title = "Untitled";
+    }
+
+    String id = jsonStringOrEmpty(item["id"]);
+    if (id.length() == 0) {
+      id = title;
+    }
+
+    String startRaw;
+    String endRaw;
+    if (item["start"].is<JsonObjectConst>()) {
+      startRaw = jsonStringOrEmpty(item["start"]["dateTime"]);
+      if (startRaw.length() == 0) {
+        startRaw = jsonStringOrEmpty(item["start"]["date"]);
+      }
+    } else {
+      startRaw = jsonStringOrEmpty(item["start"]);
+    }
+    if (item["end"].is<JsonObjectConst>()) {
+      endRaw = jsonStringOrEmpty(item["end"]["dateTime"]);
+      if (endRaw.length() == 0) {
+        endRaw = jsonStringOrEmpty(item["end"]["date"]);
+      }
+    } else {
+      endRaw = jsonStringOrEmpty(item["end"]);
+    }
+
+    time_t startEpoch = 0;
+    if (!parseIsoTimestamp(startRaw, startEpoch)) {
+      continue;
+    }
+    time_t endEpoch = 0;
+    if (!parseIsoTimestamp(endRaw, endEpoch)) {
+      endEpoch = startEpoch + 3600;
+    }
+
+    CalendarEventItem& ev = calendarEvents[calendarEventCount++];
+    ev.id = id;
+    ev.title = title;
+    ev.startEpoch = startEpoch;
+    ev.endEpoch = endEpoch;
+    ev.startLabel = formatTimeLabel(startEpoch, true);
+    ev.endLabel = formatTimeLabel(endEpoch, false);
+    ev.alerted = false;
+  }
+
+  sortCalendarEvents();
+  return true;
+}
+
+bool parseSyncedTasksPayload(const String& payload, String& outError) {
+  outError = "";
+  DynamicJsonDocument doc(24576);
+  const auto jsonErr = deserializeJson(doc, payload);
+  if (jsonErr) {
+    outError = "Tasks JSON parse failed";
+    return false;
+  }
+
+  JsonArray arr;
+  if (doc.is<JsonArray>()) {
+    arr = doc.as<JsonArray>();
+  } else if (doc["items"].is<JsonArray>()) {
+    arr = doc["items"].as<JsonArray>();
+  } else if (doc["tasks"].is<JsonArray>()) {
+    arr = doc["tasks"].as<JsonArray>();
+  } else {
+    outError = "Tasks payload missing array";
+    return false;
+  }
+
+  syncedTaskCount = 0;
+  for (JsonVariantConst item : arr) {
+    if (syncedTaskCount >= MAX_SYNC_TASKS) {
+      break;
+    }
+
+    String title = jsonStringOrEmpty(item["title"]);
+    if (title.length() == 0) {
+      title = jsonStringOrEmpty(item["name"]);
+    }
+    if (title.length() == 0) {
+      title = jsonStringOrEmpty(item["text"]);
+    }
+    if (title.length() == 0) {
+      continue;
+    }
+
+    String id = jsonStringOrEmpty(item["id"]);
+    if (id.length() == 0) {
+      id = String("task_") + syncedTaskCount;
+    }
+
+    bool completed = false;
+    if (item["completed"].is<bool>()) {
+      completed = item["completed"].as<bool>();
+    } else {
+      const String status = jsonStringOrEmpty(item["status"]);
+      completed = status.equalsIgnoreCase("completed") || status.equalsIgnoreCase("done");
+    }
+
+    String due = jsonStringOrEmpty(item["due"]);
+    if (due.length() == 0) {
+      due = jsonStringOrEmpty(item["due_date"]);
+    }
+    if (due.length() == 0) {
+      due = jsonStringOrEmpty(item["dueDate"]);
+    }
+
+    time_t dueEpoch = 0;
+    String dueLabel = "";
+    if (parseIsoTimestamp(due, dueEpoch)) {
+      dueLabel = formatDateLabel(dueEpoch);
+    } else {
+      dueLabel = due;
+    }
+
+    SyncedTaskItem& t = syncedTasks[syncedTaskCount++];
+    t.id = id;
+    t.title = title;
+    t.dueLabel = dueLabel;
+    t.completed = completed;
+  }
+
+  sortSyncedTasks();
+  return true;
+}
+
+String resolveCalendarEndpoint() {
+  if (strlen(CLOUD_CALENDAR_EVENTS_URL) > 0) {
+    return String(CLOUD_CALENDAR_EVENTS_URL);
+  }
+  if (strlen(HA_CALENDAR_ENTITY_ID) > 0 && isHomeAssistantConfigured()) {
+    String endpoint = joinedUrl(HA_BASE_URL, String("/api/calendars/") + String(HA_CALENDAR_ENTITY_ID));
+    const time_t nowEpoch = time(nullptr);
+    if (nowEpoch > 100000) {
+      const time_t endEpoch = nowEpoch + (static_cast<time_t>(CLOUD_SYNC_DAYS_AHEAD) * 86400);
+      endpoint += "?start=" + urlEncode(isoUtc(nowEpoch));
+      endpoint += "&end=" + urlEncode(isoUtc(endEpoch));
+    }
+    return endpoint;
+  }
+  return "";
+}
+
+String resolveTasksEndpoint() {
+  if (strlen(CLOUD_TASKS_LIST_URL) > 0) {
+    return String(CLOUD_TASKS_LIST_URL);
+  }
+  return "";
+}
+
+bool fetchCalendarFromCloud(String& outError) {
+  outError = "";
+  const String endpoint = resolveCalendarEndpoint();
+  if (endpoint.length() == 0) {
+    outError = "Calendar endpoint not configured";
+    return false;
+  }
+
+  String body;
+  if (!httpGetJsonWithAuth(endpoint, body, outError)) {
+    return false;
+  }
+
+  return parseCalendarPayload(body, outError);
+}
+
+bool fetchSyncedTasksFromCloud(String& outError) {
+  outError = "";
+  const String endpoint = resolveTasksEndpoint();
+  if (endpoint.length() == 0) {
+    outError = "Task endpoint not configured";
+    return false;
+  }
+
+  String body;
+  if (!httpGetJsonWithAuth(endpoint, body, outError)) {
+    return false;
+  }
+
+  return parseSyncedTasksPayload(body, outError);
+}
+
+bool saveCloudCache(String& outError) {
+  outError = "";
+  if (!sdReady) {
+    outError = "SD unavailable";
+    return false;
+  }
+
+  DynamicJsonDocument doc(24576);
+  doc["saved_at"] = static_cast<int64_t>(time(nullptr));
+  doc["calendar_count"] = static_cast<uint32_t>(calendarEventCount);
+  doc["tasks_count"] = static_cast<uint32_t>(syncedTaskCount);
+
+  JsonArray cal = doc.createNestedArray("calendar");
+  for (size_t i = 0; i < calendarEventCount; ++i) {
+    JsonObject obj = cal.createNestedObject();
+    obj["id"] = calendarEvents[i].id;
+    obj["title"] = calendarEvents[i].title;
+    obj["start_epoch"] = static_cast<int64_t>(calendarEvents[i].startEpoch);
+    obj["end_epoch"] = static_cast<int64_t>(calendarEvents[i].endEpoch);
+    obj["alerted"] = calendarEvents[i].alerted;
+  }
+
+  JsonArray tasks = doc.createNestedArray("tasks");
+  for (size_t i = 0; i < syncedTaskCount; ++i) {
+    JsonObject obj = tasks.createNestedObject();
+    obj["id"] = syncedTasks[i].id;
+    obj["title"] = syncedTasks[i].title;
+    obj["due"] = syncedTasks[i].dueLabel;
+    obj["completed"] = syncedTasks[i].completed;
+  }
+
+  if (SD_MMC.exists("/voice/dashboard_cache.json")) {
+    SD_MMC.remove("/voice/dashboard_cache.json");
+  }
+  File f = SD_MMC.open("/voice/dashboard_cache.json", FILE_WRITE);
+  if (!f) {
+    outError = "Cache open failed";
+    return false;
+  }
+  if (serializeJson(doc, f) == 0) {
+    f.close();
+    outError = "Cache write failed";
+    return false;
+  }
+  f.flush();
+  f.close();
+  cloudDataLoadedFromCache = true;
+  return true;
+}
+
+bool loadCloudCache(String& outError) {
+  outError = "";
+  if (!sdReady) {
+    outError = "SD unavailable";
+    return false;
+  }
+  if (!SD_MMC.exists("/voice/dashboard_cache.json")) {
+    outError = "No cache file";
+    return false;
+  }
+
+  File f = SD_MMC.open("/voice/dashboard_cache.json", FILE_READ);
+  if (!f) {
+    outError = "Cache open failed";
+    return false;
+  }
+
+  DynamicJsonDocument doc(24576);
+  const auto jsonErr = deserializeJson(doc, f);
+  f.close();
+  if (jsonErr) {
+    outError = "Cache parse failed";
+    return false;
+  }
+
+  calendarEventCount = 0;
+  if (doc["calendar"].is<JsonArray>()) {
+    for (JsonVariantConst item : doc["calendar"].as<JsonArray>()) {
+      if (calendarEventCount >= MAX_CALENDAR_EVENTS) {
+        break;
+      }
+      CalendarEventItem& ev = calendarEvents[calendarEventCount++];
+      ev.id = jsonStringOrEmpty(item["id"]);
+      ev.title = jsonStringOrEmpty(item["title"]);
+      ev.startEpoch = static_cast<time_t>(item["start_epoch"] | 0);
+      ev.endEpoch = static_cast<time_t>(item["end_epoch"] | 0);
+      ev.alerted = item["alerted"] | false;
+      ev.startLabel = formatTimeLabel(ev.startEpoch, true);
+      ev.endLabel = formatTimeLabel(ev.endEpoch, false);
+    }
+    sortCalendarEvents();
+  }
+
+  syncedTaskCount = 0;
+  if (doc["tasks"].is<JsonArray>()) {
+    for (JsonVariantConst item : doc["tasks"].as<JsonArray>()) {
+      if (syncedTaskCount >= MAX_SYNC_TASKS) {
+        break;
+      }
+      SyncedTaskItem& task = syncedTasks[syncedTaskCount++];
+      task.id = jsonStringOrEmpty(item["id"]);
+      task.title = jsonStringOrEmpty(item["title"]);
+      task.dueLabel = jsonStringOrEmpty(item["due"]);
+      task.completed = item["completed"] | false;
+    }
+    sortSyncedTasks();
+  }
+
+  cloudDataLoadedFromCache = true;
+  return true;
+}
+
+void uiRefreshCalendarList() {
+  if (!uiListCalendar) {
+    return;
+  }
+  lv_obj_clean(uiListCalendar);
+
+  if (calendarEventCount == 0) {
+    lv_list_add_text(uiListCalendar, "No cached events");
+    return;
+  }
+
+  const int32_t todayKey = localDayKey(time(nullptr));
+  for (size_t i = 0; i < calendarEventCount; ++i) {
+    const CalendarEventItem& ev = calendarEvents[i];
+    const int32_t eventDayKey = localDayKey(ev.startEpoch);
+    const String dayPrefix = eventDayKey == todayKey ? "Today " : formatDateLabel(ev.startEpoch) + " ";
+    String line = dayPrefix + formatTimeLabel(ev.startEpoch, false) + "  " + clipText(ev.title, 38);
+    lv_obj_t* btn = lv_list_add_btn(uiListCalendar, LV_SYMBOL_RIGHT, line.c_str());
+
+    const time_t nowEpoch = time(nullptr);
+    if (nowEpoch > 100000 && ev.startEpoch > nowEpoch && (ev.startEpoch - nowEpoch) <= (CALENDAR_ALERT_LEAD_MINUTES * 60)) {
+      lv_obj_set_style_text_color(btn, lv_color_hex(0xFBBF24), LV_PART_MAIN);
+    } else {
+      lv_obj_set_style_text_color(btn, lv_color_hex(0xD1D5DB), LV_PART_MAIN);
+    }
+  }
+}
+
+void uiRefreshSyncTasksList() {
+  if (!uiListSyncTasks) {
+    return;
+  }
+  lv_obj_clean(uiListSyncTasks);
+
+  if (syncedTaskCount == 0) {
+    lv_list_add_text(uiListSyncTasks, "No synced tasks");
+    return;
+  }
+
+  for (size_t i = 0; i < syncedTaskCount; ++i) {
+    const SyncedTaskItem& task = syncedTasks[i];
+    String line = String(task.completed ? "[x] " : "[ ] ") + clipText(task.title, 34);
+    if (task.dueLabel.length() > 0) {
+      line += " (" + clipText(task.dueLabel, 12) + ")";
+    }
+    lv_obj_t* btn = lv_list_add_btn(uiListSyncTasks, task.completed ? LV_SYMBOL_OK : LV_SYMBOL_MINUS, line.c_str());
+    lv_obj_add_event_cb(
+        btn,
+        uiSyncedTaskToggleEventCb,
+        LV_EVENT_CLICKED,
+        reinterpret_cast<void*>(static_cast<uintptr_t>(i + 1)));
+    lv_obj_set_style_text_color(btn, task.completed ? lv_color_hex(0x9CA3AF) : lv_color_hex(0xE5E7EB), LV_PART_MAIN);
+  }
+}
+
+bool postTaskCompletionWebhook(const SyncedTaskItem& task, bool completed, String& outError) {
+  outError = "";
+  if (strlen(CLOUD_TASK_COMPLETE_WEBHOOK_URL) == 0) {
+    outError = "Task completion webhook not set";
+    return false;
+  }
+
+  DynamicJsonDocument doc(512);
+  doc["id"] = task.id;
+  doc["title"] = task.title;
+  doc["completed"] = completed;
+  doc["status"] = completed ? "completed" : "needsAction";
+  String payload;
+  serializeJson(doc, payload);
+  return httpPostJsonWithAuth(String(CLOUD_TASK_COMPLETE_WEBHOOK_URL), payload, outError);
+}
+
+bool playAlertChime() {
+  if (!i2sMicReady) {
+    return false;
+  }
+
+  static int16_t toneBuf[4096];
+  size_t idx = 0;
+  const auto appendTone = [&](float freqHz, uint16_t ms, float gain) {
+    const size_t count = static_cast<size_t>((CAPTURE_SAMPLE_RATE * ms) / 1000UL);
+    for (size_t i = 0; i < count && idx < (sizeof(toneBuf) / sizeof(toneBuf[0])); ++i) {
+      const float phase = (2.0f * PI * freqHz * static_cast<float>(i)) / static_cast<float>(CAPTURE_SAMPLE_RATE);
+      const float sample = sinf(phase) * gain;
+      toneBuf[idx++] = static_cast<int16_t>(sample * 32767.0f);
+    }
+    const size_t gap = CAPTURE_SAMPLE_RATE / 100;
+    for (size_t i = 0; i < gap && idx < (sizeof(toneBuf) / sizeof(toneBuf[0])); ++i) {
+      toneBuf[idx++] = 0;
+    }
+  };
+
+  appendTone(880.0f, 90, 0.20f);
+  appendTone(1174.0f, 90, 0.18f);
+  appendTone(1568.0f, 120, 0.16f);
+  if (idx == 0) {
+    return false;
+  }
+  return micCapture.playPcm16Blocking(
+      reinterpret_cast<const uint8_t*>(toneBuf),
+      idx * sizeof(int16_t),
+      CAPTURE_SAMPLE_RATE);
+}
+
+void checkCalendarAlerts(uint32_t nowMs) {
+  static uint32_t lastCheckMs = 0;
+  if (nowMs - lastCheckMs < 4000) {
+    return;
+  }
+  lastCheckMs = nowMs;
+
+  const time_t nowEpoch = time(nullptr);
+  if (nowEpoch < 100000 || calendarEventCount == 0) {
+    return;
+  }
+
+  for (size_t i = 0; i < calendarEventCount; ++i) {
+    CalendarEventItem& ev = calendarEvents[i];
+    if (ev.alerted) {
+      continue;
+    }
+    if (ev.startEpoch <= nowEpoch) {
+      continue;
+    }
+    const time_t secondsUntil = ev.startEpoch - nowEpoch;
+    if (secondsUntil > (CALENDAR_ALERT_LEAD_MINUTES * 60)) {
+      continue;
+    }
+
+    ev.alerted = true;
+    const uint32_t mins = static_cast<uint32_t>((secondsUntil + 59) / 60);
+    uiSetCalendarStatus(String("Upcoming: ") + clipText(ev.title, 28) + " in " + mins + "m");
+    playAlertChime();
+    String cacheErr;
+    saveCloudCache(cacheErr);
+    return;
+  }
+}
+
+void syncClockIfNeeded() {
+  static bool tzSet = false;
+  static uint32_t lastNtpTryMs = 0;
+  const uint32_t nowMs = millis();
+
+  if (!tzSet) {
+    setenv("TZ", DEVICE_TZ, 1);
+    tzset();
+    tzSet = true;
+  }
+
+  const time_t nowEpoch = time(nullptr);
+  if (nowEpoch > 1700000000) {
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  if ((nowMs - lastNtpTryMs) < 30000) {
+    return;
+  }
+  lastNtpTryMs = nowMs;
+
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  struct tm tmNow {};
+  for (int i = 0; i < 6; ++i) {
+    if (getLocalTime(&tmNow, 800)) {
+      return;
+    }
+    delay(100);
+  }
+}
+
+bool syncCloudData(bool force, String& outError) {
+  outError = "";
+  const uint32_t nowMs = millis();
+  if (!force && (nowMs - lastCloudSyncAttemptMs) < CLOUD_SYNC_RETRY_MS) {
+    outError = "Sync cooling down";
+    return false;
+  }
+  lastCloudSyncAttemptMs = nowMs;
+
+  syncClockIfNeeded();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    String cacheErr;
+    if (loadCloudCache(cacheErr)) {
+      uiSetCalendarStatus("Offline: showing cached data");
+      uiSetSyncTasksStatus("Offline: showing cached tasks");
+      uiRefreshCalendarList();
+      uiRefreshSyncTasksList();
+      return true;
+    }
+    outError = "Wi-Fi disconnected";
+    return false;
+  }
+
+  bool anySuccess = false;
+  String errCalendar;
+  if (resolveCalendarEndpoint().length() > 0) {
+    if (fetchCalendarFromCloud(errCalendar)) {
+      anySuccess = true;
+      uiSetCalendarStatus("Calendar synced");
+      uiRefreshCalendarList();
+    } else {
+      uiSetCalendarStatus("Calendar sync failed: " + clipText(errCalendar, 40));
+    }
+  } else {
+    uiSetCalendarStatus("Calendar endpoint not configured");
+  }
+
+  String errTasks;
+  if (resolveTasksEndpoint().length() > 0) {
+    if (fetchSyncedTasksFromCloud(errTasks)) {
+      anySuccess = true;
+      uiSetSyncTasksStatus("Tasks synced");
+      uiRefreshSyncTasksList();
+    } else {
+      uiSetSyncTasksStatus("Task sync failed: " + clipText(errTasks, 40));
+    }
+  } else {
+    uiSetSyncTasksStatus("Task endpoint not configured");
+  }
+
+  if (!anySuccess) {
+    outError = errCalendar.length() > 0 ? errCalendar : errTasks;
+    if (outError.length() == 0) {
+      outError = "No sync sources configured";
+    }
+    return false;
+  }
+
+  String cacheErr;
+  if (!saveCloudCache(cacheErr)) {
+    Serial.println(String("[CACHE] save failed: ") + cacheErr);
+  }
+  return true;
+}
+
+void maybeRunScheduledCloudSync(uint32_t nowMs) {
+  syncClockIfNeeded();
+
+  const time_t nowEpoch = time(nullptr);
+  if (nowEpoch <= 100000) {
+    return;
+  }
+
+  struct tm tmLocal {};
+  localtime_r(&nowEpoch, &tmLocal);
+  const int32_t dayKey = localDayKey(nowEpoch);
+  if (tmLocal.tm_hour == 6 && tmLocal.tm_min < 6 && dayKey != lastCloudSyncDayKey) {
+    lastCloudSyncDayKey = dayKey;
+    cloudSyncRequested = true;
+  }
 }
 
 VadSnapshot sampleAnalogVadSnapshot() {
@@ -641,6 +1990,7 @@ void uiUpdateMicLevelLine() {
   }
 
   lv_label_set_text(uiLabelMic, clipText(line, 90).c_str());
+  lv_obj_set_style_text_color(uiLabelMic, hasLine ? lv_color_hex(0xA5F3FC) : lv_color_hex(0xFCA5A5), LV_PART_MAIN);
 
   static uint32_t lastMicSerialMs = 0;
   if ((now - lastMicSerialMs) > 2000) {
@@ -770,7 +2120,8 @@ bool captureI2SMicUntilStop(
     int16_t* out,
     size_t capacitySamples,
     size_t& outSamples,
-    CaptureMetrics& metrics) {
+    CaptureMetrics& metrics,
+    bool autoStopOnSilence = false) {
   outSamples = 0;
   if (!out || capacitySamples == 0 || !i2sMicReady) {
     return false;
@@ -778,7 +2129,9 @@ bool captureI2SMicUntilStop(
 
   const size_t chunkSamples = CAPTURE_SAMPLE_RATE / 5;  // ~200ms chunks for responsive stop.
   const uint32_t startMs = millis();
-  const uint32_t maxMs = 8000;
+  const uint32_t maxMs = autoStopOnSilence ? DICTATION_CAPTURE_MAX_MS : MANUAL_CAPTURE_MAX_MS;
+  bool speechDetected = false;
+  uint8_t silentChunks = 0;
 
   while (outSamples < capacitySamples) {
     if (assistantStopRequested) {
@@ -798,6 +2151,32 @@ bool captureI2SMicUntilStop(
       break;
     }
     outSamples += toCapture;
+
+    if (autoStopOnSilence) {
+      const bool chunkHasSpeech =
+          chunkMetrics.rmsNorm >= DICTATION_SPEECH_START_RMS ||
+          chunkMetrics.peakNorm >= DICTATION_SPEECH_START_PEAK;
+
+      if (chunkHasSpeech) {
+        speechDetected = true;
+        silentChunks = 0;
+      } else if (speechDetected) {
+        const bool chunkIsSilent =
+            chunkMetrics.rmsNorm <= DICTATION_SILENCE_RMS &&
+            chunkMetrics.peakNorm <= DICTATION_SILENCE_PEAK;
+        if (chunkIsSilent) {
+          if (silentChunks < 255) {
+            silentChunks++;
+          }
+          if (silentChunks >= DICTATION_END_SILENT_CHUNKS) {
+            Serial.println(String("[MIC] dictation auto-stop silence after ") + outSamples + " samples");
+            break;
+          }
+        } else {
+          silentChunks = 0;
+        }
+      }
+    }
 
     lv_timer_handler();
     delay(1);
@@ -821,7 +2200,8 @@ bool captureAnalogMicUntilStop(
     int16_t* out,
     size_t capacitySamples,
     size_t& outSamples,
-    CaptureMetrics& metrics) {
+    CaptureMetrics& metrics,
+    bool shortWindow = false) {
   outSamples = 0;
   if (!out || capacitySamples == 0) {
     return false;
@@ -836,7 +2216,7 @@ bool captureAnalogMicUntilStop(
   const uint32_t intervalUs = 1000000UL / CAPTURE_SAMPLE_RATE;
   uint32_t nextUs = micros();
   const uint32_t startMs = millis();
-  const uint32_t maxMs = 8000;
+  const uint32_t maxMs = shortWindow ? DICTATION_CAPTURE_MAX_MS : MANUAL_CAPTURE_MAX_MS;
 
   while (outSamples < capacitySamples) {
     if (assistantStopRequested) {
@@ -1543,9 +2923,18 @@ bool saveCaptureToSd(const int16_t* samples, size_t sampleCount, String& outPath
   return true;
 }
 
-bool homeAssistantStt(const int16_t* samples, size_t sampleCount, String& outText, String& outError) {
+bool homeAssistantStt(
+    const int16_t* samples,
+    size_t sampleCount,
+    String& outText,
+    String& outError,
+    uint8_t maxRetries = STT_MAX_RETRIES) {
   if (!isHomeAssistantConfigured()) {
     outError = "HA not configured";
+    return false;
+  }
+  if (strlen(HA_STT_PROVIDER) == 0) {
+    outError = "STT provider not configured";
     return false;
   }
 
@@ -1567,7 +2956,7 @@ bool homeAssistantStt(const int16_t* samples, size_t sampleCount, String& outTex
     const String speechHeader = String("language=") + languageTag +
                                 ";format=wav;codec=pcm;bit_rate=16;sample_rate=16000;channel=1";
 
-    for (uint8_t retry = 0; retry <= STT_MAX_RETRIES; ++retry) {
+    for (uint8_t retry = 0; retry <= maxRetries; ++retry) {
       if (WiFi.status() != WL_CONNECTED) {
         attemptErr = "STT Wi-Fi disconnected";
         return false;
@@ -1645,7 +3034,7 @@ bool homeAssistantStt(const int16_t* samples, size_t sampleCount, String& outTex
                       String(" port ") + endpointPort;
       }
 
-      if (isRetryableSttTransportError(code) && retry < STT_MAX_RETRIES) {
+      if (isRetryableSttTransportError(code) && retry < maxRetries) {
         delay(180 + retry * 180);
         continue;
       }
@@ -1736,6 +3125,162 @@ bool homeAssistantConversation(const String& text, String& outReply, String& out
   }
 
   return true;
+}
+
+String normalizeTaskCommandText(const String& in) {
+  String out = in;
+  out.replace("\r", " ");
+  out.replace("\n", " ");
+  out.trim();
+
+  String compact;
+  compact.reserve(out.length());
+  bool lastSpace = false;
+  for (size_t i = 0; i < out.length(); ++i) {
+    const char c = out[i];
+    if (c == ' ' || c == '\t') {
+      if (!lastSpace && compact.length() > 0) {
+        compact += ' ';
+      }
+      lastSpace = true;
+    } else {
+      compact += c;
+      lastSpace = false;
+    }
+  }
+  compact.trim();
+  return compact;
+}
+
+int nextPendingTaskIndex() {
+  for (size_t i = 0; i < taskCount; ++i) {
+    if (!taskQueue[i].completed) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+void uiRefreshTaskLog() {
+  if (!uiTaTaskLog) {
+    return;
+  }
+
+  if (taskCount == 0) {
+    lv_textarea_set_text(uiTaTaskLog, "No queued commands.\n\nUse Queue to add one.");
+    return;
+  }
+
+  String log;
+  for (size_t i = 0; i < taskCount; ++i) {
+    const TaskItem& item = taskQueue[i];
+    log += String(i + 1) + ". ";
+    if (!item.completed) {
+      log += "[ ] ";
+    } else {
+      log += item.success ? "[OK] " : "[!!] ";
+    }
+    log += clipText(item.command, 46);
+    if (item.completed && item.result.length() > 0) {
+      log += " -> ";
+      log += clipText(item.result, 42);
+    }
+    log += "\n";
+  }
+  lv_textarea_set_text(uiTaTaskLog, log.c_str());
+  lv_textarea_set_cursor_pos(uiTaTaskLog, LV_TEXTAREA_CURSOR_LAST);
+}
+
+bool queueTaskCommand(const String& text) {
+  const String normalized = normalizeTaskCommandText(text);
+  if (normalized.length() == 0) {
+    uiSetTaskStatus("Command is empty");
+    return false;
+  }
+
+  if (taskCount >= MAX_TASK_ITEMS) {
+    for (size_t i = 1; i < taskCount; ++i) {
+      taskQueue[i - 1] = taskQueue[i];
+    }
+    taskCount = MAX_TASK_ITEMS - 1;
+  }
+
+  taskQueue[taskCount].command = normalized;
+  taskQueue[taskCount].result = "";
+  taskQueue[taskCount].completed = false;
+  taskQueue[taskCount].success = false;
+  taskCount++;
+
+  uiRefreshTaskLog();
+  uiSetTaskStatus(String("Queued #") + taskCount);
+  return true;
+}
+
+bool runTaskAtIndex(size_t idx) {
+  if (idx >= taskCount) {
+    return false;
+  }
+
+  TaskItem& item = taskQueue[idx];
+  String reply;
+  String err;
+
+  if (!isHomeAssistantConfigured() || WiFi.status() != WL_CONNECTED) {
+    item.completed = true;
+    item.success = false;
+    item.result = "HA offline";
+    uiRefreshTaskLog();
+    return false;
+  }
+
+  const bool ok = homeAssistantConversation(item.command, reply, err);
+  item.completed = true;
+  item.success = ok;
+  item.result = ok ? clipText(reply, 56) : clipText(err, 56);
+  uiRefreshTaskLog();
+  return ok;
+}
+
+bool runNextQueuedTask() {
+  const int idx = nextPendingTaskIndex();
+  if (idx < 0) {
+    uiSetTaskStatus("No pending tasks");
+    return false;
+  }
+
+  uiSetTalkEnabled(false);
+  uiSetTaskStatus(String("Running #") + String(idx + 1));
+  setState(AssistantState::Thinking, String("Running task ") + String(idx + 1));
+  uiRefreshNow();
+  const bool ok = runTaskAtIndex(static_cast<size_t>(idx));
+  setState(AssistantState::Idle, ok ? "Task complete" : "Task failed");
+  uiSetTalkEnabled(true);
+  uiSetTaskStatus(ok ? "Done" : "Failed");
+  return ok;
+}
+
+void runAllQueuedTasks() {
+  uiSetTalkEnabled(false);
+  setState(AssistantState::Thinking, "Running queued tasks...");
+  int processed = 0;
+  while (processed < static_cast<int>(MAX_TASK_ITEMS)) {
+    const int idx = nextPendingTaskIndex();
+    if (idx < 0) {
+      break;
+    }
+    uiSetTaskStatus(String("Running #") + String(idx + 1));
+    if (assistantStopRequested) {
+      assistantStopRequested = false;
+      break;
+    }
+    runTaskAtIndex(static_cast<size_t>(idx));
+    processed++;
+    lv_timer_handler();
+    delay(10);
+  }
+  setState(AssistantState::Idle, "Task run finished");
+  uiSetTalkEnabled(true);
+  uiSetTaskStatus("Run complete");
 }
 
 bool homeAssistantFetchCoreUrls(String& outInternalUrl, String& outExternalUrl, String& outError) {
@@ -2142,30 +3687,74 @@ void uiUpdateStatus() {
   }
 
   if (uiLabelState) {
-    lv_label_set_text(uiLabelState, stateName(state));
+    const String stateLine = String("Status: ") + stateName(state);
+    lv_label_set_text(uiLabelState, stateLine.c_str());
+    lv_obj_set_style_text_color(uiLabelState, uiStateColor(state), LV_PART_MAIN);
+  }
+  if (uiIconState) {
+    const char* icon = LV_SYMBOL_PLAY;
+    if (state == AssistantState::Listening) {
+      icon = LV_SYMBOL_AUDIO;
+    } else if (state == AssistantState::Thinking) {
+      icon = LV_SYMBOL_REFRESH;
+    } else if (state == AssistantState::Speaking) {
+      icon = LV_SYMBOL_VOLUME_MAX;
+    } else if (state == AssistantState::Error) {
+      icon = LV_SYMBOL_WARNING;
+    } else if (state == AssistantState::Booting || state == AssistantState::ConnectingWiFi) {
+      icon = LV_SYMBOL_LOOP;
+    }
+    lv_label_set_text(uiIconState, icon);
+    lv_obj_set_style_text_color(uiIconState, uiStateColor(state), LV_PART_MAIN);
   }
 
   if (uiLabelDetail) {
-    lv_label_set_text(uiLabelDetail, clipText(stateDetail, 80).c_str());
+    lv_label_set_text(uiLabelDetail, clipText(stateDetail, 52).c_str());
   }
 
-  if (uiLabelWifi) {
-    if (WiFi.status() == WL_CONNECTED) {
-      const String wifiLine = String("Wi-Fi: ") + WiFi.SSID() + "  " + WiFi.localIP().toString();
-      lv_label_set_text(uiLabelWifi, clipText(wifiLine, 80).c_str());
-    } else {
-      lv_label_set_text(uiLabelWifi, "Wi-Fi: disconnected");
+  if (uiLabelHint) {
+    lv_label_set_text(uiLabelHint, clipText(uiStateHint(state), 52).c_str());
+    lv_obj_set_style_text_color(uiLabelHint, lv_color_hex(0x94A3B8), LV_PART_MAIN);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (uiLabelWifi) {
+      const String wifiLine = String("Wi-Fi: ") + WiFi.SSID() + "  " + String(WiFi.RSSI()) + " dBm";
+      lv_label_set_text(uiLabelWifi, clipText(wifiLine, 52).c_str());
+      lv_obj_set_style_text_color(uiLabelWifi, lv_color_hex(0x86EFAC), LV_PART_MAIN);
     }
+    if (uiIconWifi) {
+      lv_obj_set_style_text_color(uiIconWifi, lv_color_hex(0x86EFAC), LV_PART_MAIN);
+    }
+  } else {
+    if (uiLabelWifi) {
+      lv_label_set_text(uiLabelWifi, "Wi-Fi: disconnected");
+      lv_obj_set_style_text_color(uiLabelWifi, lv_color_hex(0xFCA5A5), LV_PART_MAIN);
+    }
+    if (uiIconWifi) {
+      lv_obj_set_style_text_color(uiIconWifi, lv_color_hex(0xF87171), LV_PART_MAIN);
+    }
+  }
+
+  if (uiIconSd) {
+    lv_obj_set_style_text_color(uiIconSd, sdReady ? lv_color_hex(0x86EFAC) : lv_color_hex(0x6B7280), LV_PART_MAIN);
+  }
+  if (uiIconMic) {
+    lv_obj_set_style_text_color(uiIconMic, audioReady ? lv_color_hex(0x67E8F9) : lv_color_hex(0xF87171), LV_PART_MAIN);
   }
 }
 
-void runCapturePipeline(bool bypassWakeWord) {
+void runCapturePipeline(bool bypassWakeWord, CaptureMode captureMode) {
+  const bool dictationMode = captureMode == CaptureMode::Dictation;
   const auto stopAndReturn = [&]() -> bool {
     if (!assistantStopRequested) {
       return false;
     }
     assistantStopRequested = false;
     setState(AssistantState::Idle, "Stopped");
+    if (dictationMode) {
+      uiSetNotesStatus("Dictation stopped");
+    }
     uiSetTalkEnabled(true);
     return true;
   };
@@ -2183,7 +3772,7 @@ void runCapturePipeline(bool bypassWakeWord) {
 
   const bool manualMode = bypassWakeWord;
   if (manualMode) {
-    setState(AssistantState::Listening, "Listening... tap Stop");
+    setState(AssistantState::Listening, dictationMode ? "Dictating... tap Stop" : "Listening... tap Stop");
   } else {
     setState(AssistantState::Listening, "Capturing 3s audio...");
   }
@@ -2203,7 +3792,12 @@ void runCapturePipeline(bool bypassWakeWord) {
     if (i2sMicReady) {
       CaptureMetrics i2sMetrics{};
       size_t manualSamples = 0;
-      if (captureI2SMicUntilStop(captureBuffer, captureBufferCapacity, manualSamples, i2sMetrics)) {
+      if (captureI2SMicUntilStop(
+              captureBuffer,
+              captureBufferCapacity,
+              manualSamples,
+              i2sMetrics,
+              dictationMode)) {
         metrics = i2sMetrics;
         captureSamples = manualSamples;
         captured = true;
@@ -2215,7 +3809,12 @@ void runCapturePipeline(bool bypassWakeWord) {
     if (i2sLooksDead && analogMicReady) {
       CaptureMetrics analogMetrics{};
       size_t manualSamples = 0;
-      if (captureAnalogMicUntilStop(captureBuffer, captureBufferCapacity, manualSamples, analogMetrics)) {
+      if (captureAnalogMicUntilStop(
+              captureBuffer,
+              captureBufferCapacity,
+              manualSamples,
+              analogMetrics,
+              dictationMode)) {
         metrics = analogMetrics;
         captureSamples = manualSamples;
         captured = true;
@@ -2240,6 +3839,9 @@ void runCapturePipeline(bool bypassWakeWord) {
     }
     if (manualMode) {
       setState(AssistantState::Idle, "Stopped");
+      if (dictationMode) {
+        uiSetNotesStatus("Dictation stopped");
+      }
       uiSetTalkEnabled(true);
       return;
     }
@@ -2300,6 +3902,9 @@ void runCapturePipeline(bool bypassWakeWord) {
 
   if (!isHomeAssistantConfigured() || WiFi.status() != WL_CONNECTED) {
     setState(AssistantState::Idle, "Captured locally");
+    if (dictationMode) {
+      uiSetNotesStatus("Dictation requires Home Assistant STT");
+    }
     uiSetTalkEnabled(true);
     return;
   }
@@ -2308,10 +3913,14 @@ void runCapturePipeline(bool bypassWakeWord) {
   String sttErr;
   setState(AssistantState::Thinking, "Transcribing...");
   uiRefreshNow();
-  if (!homeAssistantStt(captureBuffer, captureSamples, transcript, sttErr)) {
+  const uint8_t sttRetries = dictationMode ? 0 : STT_MAX_RETRIES;
+  if (!homeAssistantStt(captureBuffer, captureSamples, transcript, sttErr, sttRetries)) {
     Serial.println(String("[STT] error: ") + sttErr);
     handsFreeCooldownUntilMs = millis() + 4500;
     setState(AssistantState::Idle, "STT failed: " + clipText(sttErr, 48));
+    if (dictationMode) {
+      uiSetNotesStatus("STT failed: " + clipText(sttErr, 34));
+    }
     uiSetTalkEnabled(true);
     return;
   }
@@ -2327,6 +3936,9 @@ void runCapturePipeline(bool bypassWakeWord) {
   if (transcript.length() == 0) {
     handsFreeCooldownUntilMs = millis() + 2800;
     setState(AssistantState::Idle, "No speech: " + clipText(levelText, 45));
+    if (dictationMode) {
+      uiSetNotesStatus("No speech detected");
+    }
     uiSetTalkEnabled(true);
     return;
   }
@@ -2356,6 +3968,15 @@ void runCapturePipeline(bool bypassWakeWord) {
   }
   wakeBypassUntilMs = 0;
   if (stopAndReturn()) {
+    return;
+  }
+
+  if (dictationMode) {
+    uiAppendDictationNote(transcript);
+    const bool queued = queueTaskCommand(transcript);
+    uiSetNotesStatus(queued ? "Saved + queued command" : "Saved to notes");
+    setState(AssistantState::Idle, queued ? "Command queued" : "Note captured");
+    uiSetTalkEnabled(true);
     return;
   }
 
@@ -2443,14 +4064,220 @@ void uiTalkButtonEventCb(lv_event_t* e) {
     return;
   }
   if (state == AssistantState::Idle) {
-    assistantStopRequested = false;
-    bypassWakeWordForNextCapture = true;
-    captureRequested = true;
-  } else {
-    assistantStopRequested = true;
-    captureRequested = false;
-    setState(state, "Stopping...");
+    requestCapture(CaptureMode::Assistant, true);
+    return;
   }
+  assistantStopRequested = true;
+  captureRequested = false;
+  setState(state, "Stopping...");
+}
+
+void uiDictateButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  if (state == AssistantState::Idle) {
+    if (uiTabview) {
+      lv_tabview_set_act(uiTabview, TAB_INDEX_NOTES, LV_ANIM_ON);
+    }
+    uiSetNotesStatus("Dictating... tap Stop");
+    requestCapture(CaptureMode::Dictation, true);
+    return;
+  }
+  assistantStopRequested = true;
+  captureRequested = false;
+  if (activeCaptureMode == CaptureMode::Dictation) {
+    uiSetNotesStatus("Stopping dictation...");
+  }
+  setState(state, "Stopping...");
+}
+
+void uiClearNotesButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  notesText = "";
+  if (uiTaNotes) {
+    lv_textarea_set_text(uiTaNotes, "");
+  }
+  uiSetNotesStatus("Notes cleared");
+}
+
+void uiOpenNotesButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  if (uiTabview) {
+    lv_tabview_set_act(uiTabview, TAB_INDEX_NOTES, LV_ANIM_ON);
+  }
+}
+
+void uiOpenConfigButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  if (uiTabview) {
+    lv_tabview_set_act(uiTabview, TAB_INDEX_CONFIG, LV_ANIM_ON);
+  }
+}
+
+void uiOpenTasksButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  if (uiTabview) {
+    lv_tabview_set_act(uiTabview, TAB_INDEX_TASKS, LV_ANIM_ON);
+  }
+}
+
+void uiOpenPocketPetButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  if (uiTabview) {
+    lv_tabview_set_act(uiTabview, TAB_INDEX_POCKET_PET, LV_ANIM_ON);
+  }
+}
+
+void uiOpenCalendarButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  if (uiTabview) {
+    lv_tabview_set_act(uiTabview, TAB_INDEX_CALENDAR, LV_ANIM_ON);
+  }
+}
+
+void uiOpenSyncTasksButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  if (uiTabview) {
+    lv_tabview_set_act(uiTabview, TAB_INDEX_SYNC_TASKS, LV_ANIM_ON);
+  }
+}
+
+void uiCloudSyncButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  cloudSyncRequested = true;
+  uiSetCalendarStatus("Sync requested...");
+  uiSetSyncTasksStatus("Sync requested...");
+}
+
+void uiSyncedTaskToggleEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+
+  const uintptr_t rawIndex = reinterpret_cast<uintptr_t>(lv_event_get_user_data(e));
+  if (rawIndex == 0) {
+    return;
+  }
+  const size_t idx = static_cast<size_t>(rawIndex - 1);
+  if (idx >= syncedTaskCount) {
+    return;
+  }
+
+  SyncedTaskItem& task = syncedTasks[idx];
+  task.completed = !task.completed;
+  const bool nowCompleted = task.completed;
+  SyncedTaskItem updatedTask = task;
+  sortSyncedTasks();
+  uiRefreshSyncTasksList();
+
+  String postErr;
+  bool cloudUpdated = false;
+  if (WiFi.status() == WL_CONNECTED && strlen(CLOUD_TASK_COMPLETE_WEBHOOK_URL) > 0) {
+    cloudUpdated = postTaskCompletionWebhook(updatedTask, nowCompleted, postErr);
+  }
+
+  String cacheErr;
+  saveCloudCache(cacheErr);
+
+  if (cloudUpdated) {
+    uiSetSyncTasksStatus("Task updated in cloud");
+  } else if (strlen(CLOUD_TASK_COMPLETE_WEBHOOK_URL) > 0) {
+    uiSetSyncTasksStatus("Local update only: " + clipText(postErr, 36));
+  } else {
+    uiSetSyncTasksStatus("Saved locally (set task webhook to sync)");
+  }
+}
+
+void uiPocketPetExitButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  if (uiTabview) {
+    lv_tabview_set_act(uiTabview, TAB_INDEX_HOME, LV_ANIM_ON);
+  }
+}
+
+void uiPocketPetFeedButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  pocketPet.hunger = clampPercentInt(static_cast<int>(pocketPet.hunger) - 26);
+  pocketPet.energy = clampPercentInt(static_cast<int>(pocketPet.energy) + 6);
+  pocketPet.mood = clampPercentInt(static_cast<int>(pocketPet.mood) + 4);
+  pocketPet.resting = false;
+  uiUpdatePocketPet();
+}
+
+void uiPocketPetPlayButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  pocketPet.energy = clampPercentInt(static_cast<int>(pocketPet.energy) - 12);
+  pocketPet.hunger = clampPercentInt(static_cast<int>(pocketPet.hunger) + 8);
+  pocketPet.mood = clampPercentInt(static_cast<int>(pocketPet.mood) + 12);
+  pocketPet.resting = false;
+  uiUpdatePocketPet();
+}
+
+void uiPocketPetRestButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  pocketPet.resting = !pocketPet.resting;
+  uiUpdatePocketPet();
+}
+
+void uiTaskQueueButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  if (!uiTaTaskInput) {
+    return;
+  }
+  const String cmd = String(lv_textarea_get_text(uiTaTaskInput));
+  if (queueTaskCommand(cmd)) {
+    lv_textarea_set_text(uiTaTaskInput, "");
+  }
+}
+
+void uiTaskRunNextButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  runNextQueuedTask();
+}
+
+void uiTaskRunAllButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  runAllQueuedTasks();
+}
+
+void uiTaskClearButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  taskCount = 0;
+  uiRefreshTaskLog();
+  uiSetTaskStatus("Queue cleared");
 }
 
 void uiWifiScanButtonEventCb(lv_event_t* e) {
@@ -2515,93 +4342,299 @@ void uiKeyboardEventCb(lv_event_t* e) {
   }
 }
 
+
 void buildUi() {
   lv_obj_t* scr = lv_scr_act();
-  lv_obj_set_style_bg_color(scr, lv_color_hex(0x0D1B2A), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_set_style_text_color(scr, lv_color_hex(0xEAF2FF), LV_PART_MAIN);
+  lv_obj_set_style_text_color(scr, lv_color_hex(0xE5E7EB), LV_PART_MAIN);
 
-  uiTabview = lv_tabview_create(scr, LV_DIR_TOP, 34);
+  uiTabview = lv_tabview_create(scr, LV_DIR_TOP, 0);
   lv_obj_set_size(uiTabview, SCREEN_WIDTH, SCREEN_HEIGHT);
+  lv_obj_set_style_bg_color(uiTabview, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_border_width(uiTabview, 0, LV_PART_MAIN);
+
+  lv_obj_t* tabBtns = lv_tabview_get_tab_btns(uiTabview);
+  lv_obj_add_flag(tabBtns, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_set_size(tabBtns, 1, 1);
 
   lv_obj_t* tabMain = lv_tabview_add_tab(uiTabview, "Assistant");
   lv_obj_t* tabConfig = lv_tabview_add_tab(uiTabview, "Config");
+  lv_obj_t* tabNotes = lv_tabview_add_tab(uiTabview, "Notes");
+  lv_obj_t* tabTasks = lv_tabview_add_tab(uiTabview, "Tasks");
+  lv_obj_t* tabPocketPet = lv_tabview_add_tab(uiTabview, "Pocket Pet");
+  lv_obj_t* tabCalendar = lv_tabview_add_tab(uiTabview, "Calendar");
+  lv_obj_t* tabSyncTasks = lv_tabview_add_tab(uiTabview, "Sync Tasks");
 
   lv_obj_set_scrollbar_mode(tabMain, LV_SCROLLBAR_MODE_OFF);
   lv_obj_set_scrollbar_mode(tabConfig, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_scrollbar_mode(tabNotes, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_scrollbar_mode(tabTasks, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_scrollbar_mode(tabPocketPet, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_scrollbar_mode(tabCalendar, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_scrollbar_mode(tabSyncTasks, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_style_pad_all(tabMain, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(tabConfig, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(tabNotes, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(tabTasks, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(tabPocketPet, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(tabCalendar, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(tabSyncTasks, 0, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(tabMain, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(tabMain, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(tabConfig, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(tabConfig, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(tabNotes, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(tabNotes, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(tabTasks, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(tabTasks, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(tabPocketPet, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(tabPocketPet, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(tabCalendar, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(tabCalendar, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(tabSyncTasks, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(tabSyncTasks, LV_OPA_COVER, LV_PART_MAIN);
 
-  uiLabelState = lv_label_create(tabMain);
-  lv_obj_align(uiLabelState, LV_ALIGN_TOP_LEFT, 8, 8);
-  lv_label_set_text(uiLabelState, "Booting");
+  lv_obj_t* statusBar = lv_obj_create(tabMain);
+  lv_obj_set_size(statusBar, SCREEN_WIDTH - 12, 62);
+  lv_obj_align(statusBar, LV_ALIGN_TOP_MID, 0, 6);
+  lv_obj_set_style_bg_color(statusBar, lv_color_hex(0x0E0E0E), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(statusBar, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(statusBar, 1, LV_PART_MAIN);
+  lv_obj_set_style_border_color(statusBar, lv_color_hex(0x2F2F2F), LV_PART_MAIN);
+  lv_obj_set_style_radius(statusBar, 8, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(statusBar, 6, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(statusBar, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_clear_flag(statusBar, LV_OBJ_FLAG_SCROLLABLE);
 
-  uiLabelDetail = lv_label_create(tabMain);
-  lv_obj_set_width(uiLabelDetail, SCREEN_WIDTH - 16);
-  lv_obj_align(uiLabelDetail, LV_ALIGN_TOP_LEFT, 8, 42);
-  lv_label_set_long_mode(uiLabelDetail, LV_LABEL_LONG_WRAP);
+  lv_obj_t* statusTop = lv_obj_create(statusBar);
+  lv_obj_set_size(statusTop, SCREEN_WIDTH - 28, 18);
+  lv_obj_align(statusTop, LV_ALIGN_TOP_LEFT, 0, 0);
+  lv_obj_set_style_bg_opa(statusTop, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_border_width(statusTop, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(statusTop, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(statusTop, 0, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(statusTop, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_clear_flag(statusTop, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_layout(statusTop, LV_LAYOUT_FLEX);
+  lv_obj_set_flex_flow(statusTop, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(statusTop, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  uiLabelState = lv_label_create(statusTop);
+  lv_obj_set_width(uiLabelState, SCREEN_WIDTH - 130);
+  lv_label_set_long_mode(uiLabelState, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_color(uiLabelState, lv_color_hex(0x34D399), LV_PART_MAIN);
+  lv_label_set_text(uiLabelState, "Ready");
+
+  lv_obj_t* statusIcons = lv_obj_create(statusTop);
+  lv_obj_set_size(statusIcons, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_opa(statusIcons, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_border_width(statusIcons, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(statusIcons, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(statusIcons, 0, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(statusIcons, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_clear_flag(statusIcons, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_layout(statusIcons, LV_LAYOUT_FLEX);
+  lv_obj_set_flex_flow(statusIcons, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(statusIcons, 6, LV_PART_MAIN);
+
+  uiIconState = lv_label_create(statusIcons);
+  lv_label_set_text(uiIconState, LV_SYMBOL_PLAY);
+  lv_obj_set_style_text_color(uiIconState, lv_color_hex(0x9CA3AF), LV_PART_MAIN);
+
+  uiIconWifi = lv_label_create(statusIcons);
+  lv_label_set_text(uiIconWifi, LV_SYMBOL_WIFI);
+  lv_obj_set_style_text_color(uiIconWifi, lv_color_hex(0x9CA3AF), LV_PART_MAIN);
+
+  uiIconSd = lv_label_create(statusIcons);
+  lv_label_set_text(uiIconSd, LV_SYMBOL_SD_CARD);
+  lv_obj_set_style_text_color(uiIconSd, lv_color_hex(0x9CA3AF), LV_PART_MAIN);
+
+  uiIconMic = lv_label_create(statusIcons);
+  lv_label_set_text(uiIconMic, LV_SYMBOL_AUDIO);
+  lv_obj_set_style_text_color(uiIconMic, lv_color_hex(0x9CA3AF), LV_PART_MAIN);
+
+  uiLabelDetail = lv_label_create(statusBar);
+  lv_obj_set_width(uiLabelDetail, SCREEN_WIDTH - 28);
+  lv_obj_align(uiLabelDetail, LV_ALIGN_TOP_LEFT, 0, 22);
+  lv_label_set_long_mode(uiLabelDetail, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_color(uiLabelDetail, lv_color_hex(0x9CA3AF), LV_PART_MAIN);
   lv_label_set_text(uiLabelDetail, "Initializing...");
 
-  uiLabelWifi = lv_label_create(tabMain);
-  lv_obj_set_width(uiLabelWifi, SCREEN_WIDTH - 16);
-  lv_obj_align(uiLabelWifi, LV_ALIGN_BOTTOM_LEFT, 8, -88);
-  lv_label_set_long_mode(uiLabelWifi, LV_LABEL_LONG_WRAP);
-  lv_label_set_text(uiLabelWifi, "Wi-Fi: disconnected");
+  uiLabelMic = lv_label_create(statusBar);
+  lv_obj_set_width(uiLabelMic, SCREEN_WIDTH - 28);
+  lv_obj_align(uiLabelMic, LV_ALIGN_TOP_LEFT, 0, 38);
+  lv_label_set_long_mode(uiLabelMic, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_color(uiLabelMic, lv_color_hex(0x67E8F9), LV_PART_MAIN);
+  lv_label_set_text(uiLabelMic, "Mic probing...");
 
-  uiLabelMic = lv_label_create(tabMain);
-  lv_obj_set_width(uiLabelMic, SCREEN_WIDTH - 16);
-  lv_obj_align(uiLabelMic, LV_ALIGN_BOTTOM_LEFT, 8, -66);
-  lv_label_set_long_mode(uiLabelMic, LV_LABEL_LONG_WRAP);
-  lv_label_set_text(uiLabelMic, "Mic: probing...");
+  lv_obj_t* grid = lv_obj_create(tabMain);
+  lv_obj_set_size(grid, SCREEN_WIDTH - 16, SCREEN_HEIGHT - 84);
+  lv_obj_align(grid, LV_ALIGN_TOP_MID, 0, 76);
+  lv_obj_set_style_bg_color(grid, lv_color_hex(0x0B0B0B), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(grid, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(grid, 1, LV_PART_MAIN);
+  lv_obj_set_style_border_color(grid, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+  lv_obj_set_style_radius(grid, 8, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(grid, 8, LV_PART_MAIN);
+  lv_obj_set_style_pad_row(grid, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_column(grid, 6, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(grid, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_layout(grid, LV_LAYOUT_GRID);
+  static lv_coord_t launcherCols[] = {LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST};
+  static lv_coord_t launcherRows[] = {LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST};
+  lv_obj_set_grid_dsc_array(grid, launcherCols, launcherRows);
 
-  uiBtnTalk = lv_btn_create(tabMain);
-  lv_obj_set_size(uiBtnTalk, 160, 48);
-  lv_obj_align(uiBtnTalk, LV_ALIGN_BOTTOM_MID, 0, -12);
+  auto styleLauncherTile = [](lv_obj_t* button, uint32_t borderColor) {
+    lv_obj_set_style_radius(button, 8, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0x161616), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(button, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(button, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(button, lv_color_hex(borderColor), LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(button, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(button, 4, LV_PART_MAIN);
+  };
+  auto styleLauncherLabel = [](lv_obj_t* label, uint32_t textColor) {
+    lv_obj_set_width(label, LV_PCT(100));
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(label, lv_color_hex(textColor), LV_PART_MAIN);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_center(label);
+  };
+
+  uiBtnTalk = lv_btn_create(grid);
+  lv_obj_set_grid_cell(uiBtnTalk, LV_GRID_ALIGN_STRETCH, 0, 1, LV_GRID_ALIGN_STRETCH, 0, 1);
+  styleLauncherTile(uiBtnTalk, 0x00FF88);
   lv_obj_add_event_cb(uiBtnTalk, uiTalkButtonEventCb, LV_EVENT_CLICKED, nullptr);
   uiLabelTalk = lv_label_create(uiBtnTalk);
-  lv_label_set_text(uiLabelTalk, "Listen");
-  lv_obj_center(uiLabelTalk);
+  lv_label_set_text(uiLabelTalk, LV_SYMBOL_AUDIO "\nListen");
+  styleLauncherLabel(uiLabelTalk, 0x00FF88);
+
+  uiBtnDictate = lv_btn_create(grid);
+  lv_obj_set_grid_cell(uiBtnDictate, LV_GRID_ALIGN_STRETCH, 1, 1, LV_GRID_ALIGN_STRETCH, 0, 1);
+  styleLauncherTile(uiBtnDictate, 0x60A5FA);
+  lv_obj_add_event_cb(uiBtnDictate, uiDictateButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  uiLabelDictate = lv_label_create(uiBtnDictate);
+  lv_label_set_text(uiLabelDictate, LV_SYMBOL_EDIT "\nDictate");
+  styleLauncherLabel(uiLabelDictate, 0x60A5FA);
+
+  uiBtnOpenCalendar = lv_btn_create(grid);
+  lv_obj_set_grid_cell(uiBtnOpenCalendar, LV_GRID_ALIGN_STRETCH, 2, 1, LV_GRID_ALIGN_STRETCH, 0, 1);
+  styleLauncherTile(uiBtnOpenCalendar, 0xF59E0B);
+  lv_obj_add_event_cb(uiBtnOpenCalendar, uiOpenCalendarButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* uiLabelOpenCalendar = lv_label_create(uiBtnOpenCalendar);
+  lv_label_set_text(uiLabelOpenCalendar, LV_SYMBOL_BELL "\nCalendar");
+  styleLauncherLabel(uiLabelOpenCalendar, 0xFDE68A);
+
+  uiBtnOpenTasks = lv_btn_create(grid);
+  lv_obj_set_grid_cell(uiBtnOpenTasks, LV_GRID_ALIGN_STRETCH, 0, 1, LV_GRID_ALIGN_STRETCH, 1, 1);
+  styleLauncherTile(uiBtnOpenTasks, 0xC084FC);
+  lv_obj_add_event_cb(uiBtnOpenTasks, uiOpenTasksButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* uiLabelOpenTasks = lv_label_create(uiBtnOpenTasks);
+  lv_label_set_text(uiLabelOpenTasks, LV_SYMBOL_LIST "\nQueue");
+  styleLauncherLabel(uiLabelOpenTasks, 0xC084FC);
+
+  uiBtnOpenSyncTasks = lv_btn_create(grid);
+  lv_obj_set_grid_cell(uiBtnOpenSyncTasks, LV_GRID_ALIGN_STRETCH, 1, 1, LV_GRID_ALIGN_STRETCH, 1, 1);
+  styleLauncherTile(uiBtnOpenSyncTasks, 0x38BDF8);
+  lv_obj_add_event_cb(uiBtnOpenSyncTasks, uiOpenSyncTasksButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* uiLabelOpenSyncTasks = lv_label_create(uiBtnOpenSyncTasks);
+  lv_label_set_text(uiLabelOpenSyncTasks, LV_SYMBOL_OK "\nTo-Dos");
+  styleLauncherLabel(uiLabelOpenSyncTasks, 0x7DD3FC);
+
+  uiBtnOpenPet = lv_btn_create(grid);
+  lv_obj_set_grid_cell(uiBtnOpenPet, LV_GRID_ALIGN_STRETCH, 2, 1, LV_GRID_ALIGN_STRETCH, 1, 1);
+  styleLauncherTile(uiBtnOpenPet, 0x6EE7B7);
+  lv_obj_add_event_cb(uiBtnOpenPet, uiOpenPocketPetButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* uiLabelOpenPet = lv_label_create(uiBtnOpenPet);
+  lv_label_set_text(uiLabelOpenPet, LV_SYMBOL_HOME "\nPocket Pet");
+  styleLauncherLabel(uiLabelOpenPet, 0x6EE7B7);
+
+  uiBtnOpenNotes = lv_btn_create(grid);
+  lv_obj_set_grid_cell(uiBtnOpenNotes, LV_GRID_ALIGN_STRETCH, 0, 1, LV_GRID_ALIGN_STRETCH, 2, 1);
+  styleLauncherTile(uiBtnOpenNotes, 0xF9A8D4);
+  lv_obj_add_event_cb(uiBtnOpenNotes, uiOpenNotesButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* uiLabelOpenNotes = lv_label_create(uiBtnOpenNotes);
+  lv_label_set_text(uiLabelOpenNotes, LV_SYMBOL_FILE "\nNotes");
+  styleLauncherLabel(uiLabelOpenNotes, 0xF9A8D4);
+
+  uiBtnOpenConfig = lv_btn_create(grid);
+  lv_obj_set_grid_cell(uiBtnOpenConfig, LV_GRID_ALIGN_STRETCH, 1, 1, LV_GRID_ALIGN_STRETCH, 2, 1);
+  styleLauncherTile(uiBtnOpenConfig, 0xFBBF24);
+  lv_obj_add_event_cb(uiBtnOpenConfig, uiOpenConfigButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* uiLabelOpenConfig = lv_label_create(uiBtnOpenConfig);
+  lv_label_set_text(uiLabelOpenConfig, LV_SYMBOL_WIFI "\nWi-Fi");
+  styleLauncherLabel(uiLabelOpenConfig, 0xFBBF24);
+
+  lv_obj_t* uiBtnSyncLauncher = lv_btn_create(grid);
+  lv_obj_set_grid_cell(uiBtnSyncLauncher, LV_GRID_ALIGN_STRETCH, 2, 1, LV_GRID_ALIGN_STRETCH, 2, 1);
+  styleLauncherTile(uiBtnSyncLauncher, 0x22C55E);
+  lv_obj_add_event_cb(uiBtnSyncLauncher, uiCloudSyncButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* uiLabelSyncLauncher = lv_label_create(uiBtnSyncLauncher);
+  lv_label_set_text(uiLabelSyncLauncher, LV_SYMBOL_REFRESH "\nSync");
+  styleLauncherLabel(uiLabelSyncLauncher, 0x86EFAC);
 
   lv_obj_t* labelSsid = lv_label_create(tabConfig);
   lv_obj_align(labelSsid, LV_ALIGN_TOP_LEFT, 8, 8);
-  lv_label_set_text(labelSsid, "Wi-Fi Network");
+  lv_label_set_text(labelSsid, "Wi-Fi Networks");
 
   uiDdSsid = lv_dropdown_create(tabConfig);
-  lv_obj_set_width(uiDdSsid, 210);
-  lv_obj_align(uiDdSsid, LV_ALIGN_TOP_LEFT, 8, 28);
+  lv_obj_set_width(uiDdSsid, 206);
+  lv_obj_align(uiDdSsid, LV_ALIGN_TOP_LEFT, 8, 30);
+  lv_obj_set_style_radius(uiDdSsid, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiDdSsid, lv_color_hex(0x10233C), LV_PART_MAIN);
+  lv_obj_set_style_text_color(uiDdSsid, lv_color_hex(0xEAF2FF), LV_PART_MAIN);
   lv_dropdown_set_options(uiDdSsid, "No scan yet");
   lv_obj_add_event_cb(uiDdSsid, uiWifiDropdownEventCb, LV_EVENT_VALUE_CHANGED, nullptr);
 
   lv_obj_t* btnScan = lv_btn_create(tabConfig);
-  lv_obj_set_size(btnScan, 86, 36);
-  lv_obj_align(btnScan, LV_ALIGN_TOP_RIGHT, -8, 28);
+  lv_obj_set_size(btnScan, 94, 36);
+  lv_obj_align(btnScan, LV_ALIGN_TOP_RIGHT, -8, 30);
+  lv_obj_set_style_radius(btnScan, 12, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(btnScan, lv_color_hex(0x2563EB), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(btnScan, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_add_event_cb(btnScan, uiWifiScanButtonEventCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* btnScanLabel = lv_label_create(btnScan);
   lv_label_set_text(btnScanLabel, "Scan");
   lv_obj_center(btnScanLabel);
 
   lv_obj_t* labelManual = lv_label_create(tabConfig);
-  lv_obj_align(labelManual, LV_ALIGN_TOP_LEFT, 8, 70);
+  lv_obj_align(labelManual, LV_ALIGN_TOP_LEFT, 8, 74);
   lv_label_set_text(labelManual, "SSID");
 
   uiTaSsid = lv_textarea_create(tabConfig);
   lv_obj_set_width(uiTaSsid, SCREEN_WIDTH - 16);
-  lv_obj_align(uiTaSsid, LV_ALIGN_TOP_LEFT, 8, 90);
+  lv_obj_align(uiTaSsid, LV_ALIGN_TOP_LEFT, 8, 94);
   lv_textarea_set_one_line(uiTaSsid, true);
+  lv_textarea_set_max_length(uiTaSsid, 63);
+  lv_textarea_set_placeholder_text(uiTaSsid, "Enter SSID");
+  lv_obj_set_style_radius(uiTaSsid, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiTaSsid, lv_color_hex(0x10233C), LV_PART_MAIN);
+  lv_obj_set_style_text_color(uiTaSsid, lv_color_hex(0xEAF2FF), LV_PART_MAIN);
   lv_obj_add_event_cb(uiTaSsid, uiTextareaEventCb, LV_EVENT_FOCUSED, nullptr);
 
   lv_obj_t* labelPwd = lv_label_create(tabConfig);
-  lv_obj_align(labelPwd, LV_ALIGN_TOP_LEFT, 8, 128);
+  lv_obj_align(labelPwd, LV_ALIGN_TOP_LEFT, 8, 132);
   lv_label_set_text(labelPwd, "Password");
 
   uiTaPassword = lv_textarea_create(tabConfig);
   lv_obj_set_width(uiTaPassword, SCREEN_WIDTH - 16);
-  lv_obj_align(uiTaPassword, LV_ALIGN_TOP_LEFT, 8, 148);
+  lv_obj_align(uiTaPassword, LV_ALIGN_TOP_LEFT, 8, 152);
   lv_textarea_set_one_line(uiTaPassword, true);
+  lv_textarea_set_max_length(uiTaPassword, 63);
+  lv_textarea_set_placeholder_text(uiTaPassword, "Enter password");
   lv_textarea_set_password_mode(uiTaPassword, true);
+  lv_obj_set_style_radius(uiTaPassword, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiTaPassword, lv_color_hex(0x10233C), LV_PART_MAIN);
+  lv_obj_set_style_text_color(uiTaPassword, lv_color_hex(0xEAF2FF), LV_PART_MAIN);
   lv_obj_add_event_cb(uiTaPassword, uiTextareaEventCb, LV_EVENT_FOCUSED, nullptr);
 
   lv_obj_t* btnSave = lv_btn_create(tabConfig);
   lv_obj_set_size(btnSave, 100, 36);
   lv_obj_align(btnSave, LV_ALIGN_BOTTOM_LEFT, 8, -10);
+  lv_obj_set_style_radius(btnSave, 12, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(btnSave, lv_color_hex(0x0F766E), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(btnSave, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_add_event_cb(btnSave, uiWifiSaveButtonEventCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* btnSaveLabel = lv_label_create(btnSave);
   lv_label_set_text(btnSaveLabel, "Save");
@@ -2610,6 +4643,9 @@ void buildUi() {
   lv_obj_t* btnConnect = lv_btn_create(tabConfig);
   lv_obj_set_size(btnConnect, 100, 36);
   lv_obj_align(btnConnect, LV_ALIGN_BOTTOM_LEFT, 116, -10);
+  lv_obj_set_style_radius(btnConnect, 12, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(btnConnect, lv_color_hex(0x1D4ED8), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(btnConnect, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_add_event_cb(btnConnect, uiWifiConnectButtonEventCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* btnConnectLabel = lv_label_create(btnConnect);
   lv_label_set_text(btnConnectLabel, "Connect");
@@ -2620,6 +4656,303 @@ void buildUi() {
   lv_obj_align(uiLabelWifiMenuStatus, LV_ALIGN_BOTTOM_RIGHT, -8, -11);
   lv_label_set_long_mode(uiLabelWifiMenuStatus, LV_LABEL_LONG_WRAP);
   lv_label_set_text(uiLabelWifiMenuStatus, "Status: idle");
+  lv_obj_set_style_text_color(uiLabelWifiMenuStatus, lv_color_hex(0x9FB3CF), LV_PART_MAIN);
+
+  lv_obj_t* notesTitle = lv_label_create(tabNotes);
+  lv_obj_align(notesTitle, LV_ALIGN_TOP_LEFT, 8, 8);
+  lv_label_set_text(notesTitle, "Dictation Notes");
+
+  uiTaNotes = lv_textarea_create(tabNotes);
+  lv_obj_set_size(uiTaNotes, SCREEN_WIDTH - 16, 146);
+  lv_obj_align(uiTaNotes, LV_ALIGN_TOP_LEFT, 8, 28);
+  lv_textarea_set_one_line(uiTaNotes, false);
+  lv_textarea_set_text(uiTaNotes, "");
+  lv_textarea_set_placeholder_text(uiTaNotes, "Dictated notes will appear here...");
+  lv_obj_set_style_radius(uiTaNotes, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiTaNotes, lv_color_hex(0x10233C), LV_PART_MAIN);
+  lv_obj_set_style_text_color(uiTaNotes, lv_color_hex(0xEAF2FF), LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(uiTaNotes, LV_SCROLLBAR_MODE_ACTIVE);
+
+  uiBtnNotesDictate = lv_btn_create(tabNotes);
+  lv_obj_set_size(uiBtnNotesDictate, 100, 36);
+  lv_obj_align(uiBtnNotesDictate, LV_ALIGN_BOTTOM_LEFT, 8, -10);
+  lv_obj_set_style_radius(uiBtnNotesDictate, 12, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiBtnNotesDictate, lv_color_hex(0x1D4ED8), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(uiBtnNotesDictate, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_event_cb(uiBtnNotesDictate, uiDictateButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  uiLabelNotesDictate = lv_label_create(uiBtnNotesDictate);
+  lv_label_set_text(uiLabelNotesDictate, "Dictate");
+  lv_obj_center(uiLabelNotesDictate);
+
+  uiBtnClearNotes = lv_btn_create(tabNotes);
+  lv_obj_set_size(uiBtnClearNotes, 100, 36);
+  lv_obj_align(uiBtnClearNotes, LV_ALIGN_BOTTOM_LEFT, 116, -10);
+  lv_obj_set_style_radius(uiBtnClearNotes, 12, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiBtnClearNotes, lv_color_hex(0x475569), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(uiBtnClearNotes, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_event_cb(uiBtnClearNotes, uiClearNotesButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* clearNotesLabel = lv_label_create(uiBtnClearNotes);
+  lv_label_set_text(clearNotesLabel, "Clear");
+  lv_obj_center(clearNotesLabel);
+
+  uiLabelNotesStatus = lv_label_create(tabNotes);
+  lv_obj_set_width(uiLabelNotesStatus, 94);
+  lv_obj_align(uiLabelNotesStatus, LV_ALIGN_BOTTOM_RIGHT, -8, -11);
+  lv_label_set_long_mode(uiLabelNotesStatus, LV_LABEL_LONG_WRAP);
+  lv_label_set_text(uiLabelNotesStatus, "Ready");
+  lv_obj_set_style_text_color(uiLabelNotesStatus, lv_color_hex(0x9FB3CF), LV_PART_MAIN);
+
+  lv_obj_t* tasksTitle = lv_label_create(tabTasks);
+  lv_obj_align(tasksTitle, LV_ALIGN_TOP_LEFT, 8, 8);
+  lv_label_set_text(tasksTitle, "Command Queue");
+
+  uiTaTaskInput = lv_textarea_create(tabTasks);
+  lv_obj_set_width(uiTaTaskInput, SCREEN_WIDTH - 16);
+  lv_obj_align(uiTaTaskInput, LV_ALIGN_TOP_LEFT, 8, 26);
+  lv_textarea_set_one_line(uiTaTaskInput, true);
+  lv_textarea_set_max_length(uiTaTaskInput, 140);
+  lv_textarea_set_placeholder_text(uiTaTaskInput, "Type command: 'turn off office lights'");
+  lv_obj_set_style_radius(uiTaTaskInput, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiTaTaskInput, lv_color_hex(0x10233C), LV_PART_MAIN);
+  lv_obj_set_style_text_color(uiTaTaskInput, lv_color_hex(0xEAF2FF), LV_PART_MAIN);
+  lv_obj_add_event_cb(uiTaTaskInput, uiTextareaEventCb, LV_EVENT_FOCUSED, nullptr);
+
+  uiBtnTaskQueue = lv_btn_create(tabTasks);
+  lv_obj_set_size(uiBtnTaskQueue, 108, 32);
+  lv_obj_align(uiBtnTaskQueue, LV_ALIGN_TOP_LEFT, 8, 64);
+  lv_obj_set_style_radius(uiBtnTaskQueue, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiBtnTaskQueue, lv_color_hex(0x0F766E), LV_PART_MAIN);
+  lv_obj_add_event_cb(uiBtnTaskQueue, uiTaskQueueButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* taskQueueLabel = lv_label_create(uiBtnTaskQueue);
+  lv_label_set_text(taskQueueLabel, "Queue");
+  lv_obj_center(taskQueueLabel);
+
+  uiBtnTaskRunNext = lv_btn_create(tabTasks);
+  lv_obj_set_size(uiBtnTaskRunNext, 108, 32);
+  lv_obj_align(uiBtnTaskRunNext, LV_ALIGN_TOP_RIGHT, -8, 64);
+  lv_obj_set_style_radius(uiBtnTaskRunNext, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiBtnTaskRunNext, lv_color_hex(0x1D4ED8), LV_PART_MAIN);
+  lv_obj_add_event_cb(uiBtnTaskRunNext, uiTaskRunNextButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* taskRunNextLabel = lv_label_create(uiBtnTaskRunNext);
+  lv_label_set_text(taskRunNextLabel, "Run Next");
+  lv_obj_center(taskRunNextLabel);
+
+  uiBtnTaskRunAll = lv_btn_create(tabTasks);
+  lv_obj_set_size(uiBtnTaskRunAll, 108, 32);
+  lv_obj_align(uiBtnTaskRunAll, LV_ALIGN_TOP_LEFT, 8, 100);
+  lv_obj_set_style_radius(uiBtnTaskRunAll, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiBtnTaskRunAll, lv_color_hex(0x2563EB), LV_PART_MAIN);
+  lv_obj_add_event_cb(uiBtnTaskRunAll, uiTaskRunAllButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* taskRunAllLabel = lv_label_create(uiBtnTaskRunAll);
+  lv_label_set_text(taskRunAllLabel, "Run All");
+  lv_obj_center(taskRunAllLabel);
+
+  uiBtnTaskClear = lv_btn_create(tabTasks);
+  lv_obj_set_size(uiBtnTaskClear, 108, 32);
+  lv_obj_align(uiBtnTaskClear, LV_ALIGN_TOP_RIGHT, -8, 100);
+  lv_obj_set_style_radius(uiBtnTaskClear, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiBtnTaskClear, lv_color_hex(0x475569), LV_PART_MAIN);
+  lv_obj_add_event_cb(uiBtnTaskClear, uiTaskClearButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* taskClearLabel = lv_label_create(uiBtnTaskClear);
+  lv_label_set_text(taskClearLabel, "Clear");
+  lv_obj_center(taskClearLabel);
+
+  uiTaTaskLog = lv_textarea_create(tabTasks);
+  lv_obj_set_size(uiTaTaskLog, SCREEN_WIDTH - 16, 142);
+  lv_obj_align(uiTaTaskLog, LV_ALIGN_TOP_LEFT, 8, 136);
+  lv_textarea_set_one_line(uiTaTaskLog, false);
+  lv_textarea_set_text(uiTaTaskLog, "No queued commands.\n\nUse Queue to add one.");
+  lv_obj_set_style_radius(uiTaTaskLog, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiTaTaskLog, lv_color_hex(0x0B1727), LV_PART_MAIN);
+  lv_obj_set_style_text_color(uiTaTaskLog, lv_color_hex(0xEAF2FF), LV_PART_MAIN);
+  lv_textarea_set_cursor_click_pos(uiTaTaskLog, false);
+  lv_obj_clear_flag(uiTaTaskLog, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+  lv_obj_set_scrollbar_mode(uiTaTaskLog, LV_SCROLLBAR_MODE_ACTIVE);
+
+  uiLabelTaskStatus = lv_label_create(tabTasks);
+  lv_obj_set_width(uiLabelTaskStatus, SCREEN_WIDTH - 16);
+  lv_obj_align(uiLabelTaskStatus, LV_ALIGN_BOTTOM_LEFT, 8, -6);
+  lv_label_set_long_mode(uiLabelTaskStatus, LV_LABEL_LONG_DOT);
+  lv_label_set_text(uiLabelTaskStatus, "Queue ready");
+  lv_obj_set_style_text_color(uiLabelTaskStatus, lv_color_hex(0x9FB3CF), LV_PART_MAIN);
+
+  lv_obj_t* petTitle = lv_label_create(tabPocketPet);
+  lv_obj_align(petTitle, LV_ALIGN_TOP_LEFT, 8, 10);
+  lv_label_set_text(petTitle, "Pocket Pet");
+  lv_obj_set_style_text_color(petTitle, lv_color_hex(0x86EFAC), LV_PART_MAIN);
+
+  lv_obj_t* btnPetExit = lv_btn_create(tabPocketPet);
+  lv_obj_set_size(btnPetExit, 74, 30);
+  lv_obj_align(btnPetExit, LV_ALIGN_TOP_RIGHT, -8, 6);
+  lv_obj_set_style_radius(btnPetExit, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(btnPetExit, lv_color_hex(0x334155), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(btnPetExit, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_event_cb(btnPetExit, uiPocketPetExitButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* petExitLabel = lv_label_create(btnPetExit);
+  lv_label_set_text(petExitLabel, "Exit");
+  lv_obj_center(petExitLabel);
+
+  lv_obj_t* petPanel = lv_obj_create(tabPocketPet);
+  lv_obj_set_size(petPanel, SCREEN_WIDTH - 16, 228);
+  lv_obj_align(petPanel, LV_ALIGN_TOP_MID, 0, 40);
+  lv_obj_set_style_bg_color(petPanel, lv_color_hex(0x101010), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(petPanel, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(petPanel, lv_color_hex(0x2E5A46), LV_PART_MAIN);
+  lv_obj_set_style_border_width(petPanel, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(petPanel, 10, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(petPanel, 8, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(petPanel, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_clear_flag(petPanel, LV_OBJ_FLAG_SCROLLABLE);
+
+  uiLabelPetFace = lv_label_create(petPanel);
+  lv_obj_align(uiLabelPetFace, LV_ALIGN_TOP_MID, 0, 2);
+  lv_label_set_text(uiLabelPetFace, "(^_^)");
+  lv_obj_set_style_text_color(uiLabelPetFace, lv_color_hex(0xA7F3D0), LV_PART_MAIN);
+
+  uiLabelPetSummary = lv_label_create(petPanel);
+  lv_obj_align(uiLabelPetSummary, LV_ALIGN_TOP_MID, 0, 24);
+  lv_label_set_text(uiLabelPetSummary, "Happy and alert");
+  lv_obj_set_style_text_color(uiLabelPetSummary, lv_color_hex(0x93C5FD), LV_PART_MAIN);
+
+  lv_obj_t* petLabelHunger = lv_label_create(petPanel);
+  lv_obj_align(petLabelHunger, LV_ALIGN_TOP_LEFT, 4, 58);
+  lv_label_set_text(petLabelHunger, "Hunger");
+  lv_obj_set_style_text_color(petLabelHunger, lv_color_hex(0xFCA5A5), LV_PART_MAIN);
+
+  uiBarPetHunger = lv_bar_create(petPanel);
+  lv_obj_set_size(uiBarPetHunger, 126, 12);
+  lv_obj_align(uiBarPetHunger, LV_ALIGN_TOP_RIGHT, -4, 60);
+  lv_bar_set_range(uiBarPetHunger, 0, 100);
+  lv_obj_set_style_bg_color(uiBarPetHunger, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiBarPetHunger, lv_color_hex(0xF97316), LV_PART_INDICATOR);
+
+  lv_obj_t* petLabelEnergy = lv_label_create(petPanel);
+  lv_obj_align(petLabelEnergy, LV_ALIGN_TOP_LEFT, 4, 82);
+  lv_label_set_text(petLabelEnergy, "Energy");
+  lv_obj_set_style_text_color(petLabelEnergy, lv_color_hex(0x93C5FD), LV_PART_MAIN);
+
+  uiBarPetEnergy = lv_bar_create(petPanel);
+  lv_obj_set_size(uiBarPetEnergy, 126, 12);
+  lv_obj_align(uiBarPetEnergy, LV_ALIGN_TOP_RIGHT, -4, 84);
+  lv_bar_set_range(uiBarPetEnergy, 0, 100);
+  lv_obj_set_style_bg_color(uiBarPetEnergy, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiBarPetEnergy, lv_color_hex(0x2563EB), LV_PART_INDICATOR);
+
+  lv_obj_t* petLabelMood = lv_label_create(petPanel);
+  lv_obj_align(petLabelMood, LV_ALIGN_TOP_LEFT, 4, 106);
+  lv_label_set_text(petLabelMood, "Mood");
+  lv_obj_set_style_text_color(petLabelMood, lv_color_hex(0xFDE68A), LV_PART_MAIN);
+
+  uiBarPetMood = lv_bar_create(petPanel);
+  lv_obj_set_size(uiBarPetMood, 126, 12);
+  lv_obj_align(uiBarPetMood, LV_ALIGN_TOP_RIGHT, -4, 108);
+  lv_bar_set_range(uiBarPetMood, 0, 100);
+  lv_obj_set_style_bg_color(uiBarPetMood, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiBarPetMood, lv_color_hex(0xCA8A04), LV_PART_INDICATOR);
+
+  lv_obj_t* btnPetFeed = lv_btn_create(petPanel);
+  lv_obj_set_size(btnPetFeed, 66, 32);
+  lv_obj_align(btnPetFeed, LV_ALIGN_BOTTOM_LEFT, 4, -34);
+  lv_obj_set_style_radius(btnPetFeed, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(btnPetFeed, lv_color_hex(0x0F766E), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(btnPetFeed, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_event_cb(btnPetFeed, uiPocketPetFeedButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* petFeedLabel = lv_label_create(btnPetFeed);
+  lv_label_set_text(petFeedLabel, "Feed");
+  lv_obj_center(petFeedLabel);
+
+  lv_obj_t* btnPetPlay = lv_btn_create(petPanel);
+  lv_obj_set_size(btnPetPlay, 66, 32);
+  lv_obj_align(btnPetPlay, LV_ALIGN_BOTTOM_MID, 0, -34);
+  lv_obj_set_style_radius(btnPetPlay, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(btnPetPlay, lv_color_hex(0x1D4ED8), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(btnPetPlay, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_event_cb(btnPetPlay, uiPocketPetPlayButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* petPlayLabel = lv_label_create(btnPetPlay);
+  lv_label_set_text(petPlayLabel, "Play");
+  lv_obj_center(petPlayLabel);
+
+  lv_obj_t* btnPetRest = lv_btn_create(petPanel);
+  lv_obj_set_size(btnPetRest, 66, 32);
+  lv_obj_align(btnPetRest, LV_ALIGN_BOTTOM_RIGHT, -4, -34);
+  lv_obj_set_style_radius(btnPetRest, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(btnPetRest, lv_color_hex(0x475569), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(btnPetRest, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_event_cb(btnPetRest, uiPocketPetRestButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  uiLabelPetRestButton = lv_label_create(btnPetRest);
+  lv_label_set_text(uiLabelPetRestButton, "Rest");
+  lv_obj_center(uiLabelPetRestButton);
+
+  uiLabelPetStatus = lv_label_create(petPanel);
+  lv_obj_align(uiLabelPetStatus, LV_ALIGN_BOTTOM_MID, 0, -8);
+  lv_label_set_text(uiLabelPetStatus, "H30%  E82%  M76%");
+  lv_obj_set_style_text_color(uiLabelPetStatus, lv_color_hex(0x9FB3CF), LV_PART_MAIN);
+
+  lv_obj_t* calTitle = lv_label_create(tabCalendar);
+  lv_obj_align(calTitle, LV_ALIGN_TOP_LEFT, 8, 10);
+  lv_label_set_text(calTitle, "Daily Calendar");
+  lv_obj_set_style_text_color(calTitle, lv_color_hex(0xFDE68A), LV_PART_MAIN);
+
+  lv_obj_t* calSyncBtn = lv_btn_create(tabCalendar);
+  lv_obj_set_size(calSyncBtn, 74, 30);
+  lv_obj_align(calSyncBtn, LV_ALIGN_TOP_RIGHT, -8, 6);
+  lv_obj_set_style_radius(calSyncBtn, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(calSyncBtn, lv_color_hex(0x14532D), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(calSyncBtn, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_event_cb(calSyncBtn, uiCloudSyncButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* calSyncLabel = lv_label_create(calSyncBtn);
+  lv_label_set_text(calSyncLabel, "Sync");
+  lv_obj_center(calSyncLabel);
+
+  uiListCalendar = lv_list_create(tabCalendar);
+  lv_obj_set_size(uiListCalendar, SCREEN_WIDTH - 16, 230);
+  lv_obj_align(uiListCalendar, LV_ALIGN_TOP_MID, 0, 40);
+  lv_obj_set_style_radius(uiListCalendar, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiListCalendar, lv_color_hex(0x101820), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(uiListCalendar, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(uiListCalendar, lv_color_hex(0x334155), LV_PART_MAIN);
+  lv_obj_set_style_border_width(uiListCalendar, 1, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(uiListCalendar, LV_SCROLLBAR_MODE_ACTIVE);
+
+  uiLabelCalendarStatus = lv_label_create(tabCalendar);
+  lv_obj_set_width(uiLabelCalendarStatus, SCREEN_WIDTH - 16);
+  lv_obj_align(uiLabelCalendarStatus, LV_ALIGN_BOTTOM_LEFT, 8, -6);
+  lv_label_set_long_mode(uiLabelCalendarStatus, LV_LABEL_LONG_DOT);
+  lv_label_set_text(uiLabelCalendarStatus, "Calendar idle");
+  lv_obj_set_style_text_color(uiLabelCalendarStatus, lv_color_hex(0x9FB3CF), LV_PART_MAIN);
+
+  lv_obj_t* syncTasksTitle = lv_label_create(tabSyncTasks);
+  lv_obj_align(syncTasksTitle, LV_ALIGN_TOP_LEFT, 8, 10);
+  lv_label_set_text(syncTasksTitle, "Interactive Tasks");
+  lv_obj_set_style_text_color(syncTasksTitle, lv_color_hex(0x7DD3FC), LV_PART_MAIN);
+
+  lv_obj_t* syncTasksSyncBtn = lv_btn_create(tabSyncTasks);
+  lv_obj_set_size(syncTasksSyncBtn, 74, 30);
+  lv_obj_align(syncTasksSyncBtn, LV_ALIGN_TOP_RIGHT, -8, 6);
+  lv_obj_set_style_radius(syncTasksSyncBtn, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(syncTasksSyncBtn, lv_color_hex(0x14532D), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(syncTasksSyncBtn, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_event_cb(syncTasksSyncBtn, uiCloudSyncButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* syncTasksSyncLabel = lv_label_create(syncTasksSyncBtn);
+  lv_label_set_text(syncTasksSyncLabel, "Sync");
+  lv_obj_center(syncTasksSyncLabel);
+
+  uiListSyncTasks = lv_list_create(tabSyncTasks);
+  lv_obj_set_size(uiListSyncTasks, SCREEN_WIDTH - 16, 230);
+  lv_obj_align(uiListSyncTasks, LV_ALIGN_TOP_MID, 0, 40);
+  lv_obj_set_style_radius(uiListSyncTasks, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiListSyncTasks, lv_color_hex(0x0F172A), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(uiListSyncTasks, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(uiListSyncTasks, lv_color_hex(0x334155), LV_PART_MAIN);
+  lv_obj_set_style_border_width(uiListSyncTasks, 1, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(uiListSyncTasks, LV_SCROLLBAR_MODE_ACTIVE);
+
+  uiLabelSyncTasksStatus = lv_label_create(tabSyncTasks);
+  lv_obj_set_width(uiLabelSyncTasksStatus, SCREEN_WIDTH - 16);
+  lv_obj_align(uiLabelSyncTasksStatus, LV_ALIGN_BOTTOM_LEFT, 8, -6);
+  lv_label_set_long_mode(uiLabelSyncTasksStatus, LV_LABEL_LONG_DOT);
+  lv_label_set_text(uiLabelSyncTasksStatus, "Task sync idle");
+  lv_obj_set_style_text_color(uiLabelSyncTasksStatus, lv_color_hex(0x9FB3CF), LV_PART_MAIN);
 
   uiKeyboard = lv_keyboard_create(scr);
   lv_obj_set_size(uiKeyboard, SCREEN_WIDTH, 110);
@@ -2632,7 +4965,16 @@ void buildUi() {
   uiSyncWifiFields();
   uiUpdateStatus();
   uiUpdateTalkButtonLabel();
+  uiUpdateDictateButtonLabel();
   uiSetWifiMenuStatus("Set Wi-Fi then Connect");
+  uiSetNotesStatus("Ready for dictation");
+  uiSetTaskStatus("Queue ready");
+  uiRefreshTaskLog();
+  uiSetCalendarStatus("Calendar idle");
+  uiSetSyncTasksStatus("Task sync idle");
+  uiRefreshCalendarList();
+  uiRefreshSyncTasksList();
+  uiUpdatePocketPet();
 }
 
 void handleWifiScan() {
@@ -2728,7 +5070,7 @@ void pollBootButton() {
     if (heldMs >= BOOT_LONG_PRESS_MS) {
       if (uiTabview) {
         const uint16_t current = lv_tabview_get_tab_act(uiTabview);
-        const uint16_t next = current == 0 ? 1 : 0;
+        const uint16_t next = (current + 1) % TAB_COUNT;
         lv_tabview_set_act(uiTabview, next, LV_ANIM_ON);
       }
       uiSetWifiMenuStatus("Long press: toggled tab");
@@ -2798,10 +5140,10 @@ void pollHandsFreeTrigger() {
     peakTriggerThreshold = 0.25f;
   }
 
-  const float speechRmsGate = dynamicVadThreshold > 0.022f ? dynamicVadThreshold : 0.022f;
+  const float speechRmsGate = dynamicVadThreshold > 0.014f ? dynamicVadThreshold : 0.014f;
   const float floorDelta = rmsNorm - vadNoiseFloorNorm;
   const float peakDelta = peakNorm - vadNoiseFloorPeakNorm;
-  const bool clearlyAboveFloor = floorDelta >= 0.0022f || peakDelta >= 0.025f;
+  const bool clearlyAboveFloor = floorDelta >= 0.0012f || peakDelta >= 0.018f;
   const bool hotRms = rmsNorm >= speechRmsGate;
   const bool hotPeak = peakNorm >= peakTriggerThreshold;
 
@@ -2829,10 +5171,11 @@ void pollHandsFreeTrigger() {
         String("% frames=") + String(vadActiveFrames));
   }
 
-  const uint8_t triggerFrames = ASSISTANT_VAD_TRIGGER_FRAMES > 3 ? ASSISTANT_VAD_TRIGGER_FRAMES : 3;
+  const uint8_t triggerFrames = ASSISTANT_VAD_TRIGGER_FRAMES > 2 ? ASSISTANT_VAD_TRIGGER_FRAMES : 2;
   if (vadActiveFrames >= triggerFrames) {
     vadActiveFrames = 0;
     handsFreeCooldownUntilMs = now + 1700;
+    pendingCaptureMode = CaptureMode::Assistant;
     bypassWakeWordForNextCapture = false;
     captureRequested = true;
     Serial.println(
@@ -2852,12 +5195,23 @@ void setup() {
   delay(200);
   Serial.println("[FW] voice_assistant_es3c28p 2026-03-31a");
 
+#if ASSISTANT_ENABLE_HANDS_FREE
+  handsFreeEnabled = true;
+#else
+  handsFreeEnabled = false;
+#endif
+  Serial.println(String("[WAKE] hands-free ") + (handsFreeEnabled ? "enabled" : "disabled"));
+  Serial.println(String("[WAKE] phrases: ") + String(HA_WAKE_PHRASE));
+
   pinMode(PIN_BOOT_BUTTON, INPUT_PULLUP);
   pinMode(PIN_TFT_BL, OUTPUT);
   digitalWrite(PIN_TFT_BL, HIGH);
 
+  // Re-run TFT_eSPI constructor at runtime to ensure internal SPI state is valid
+  // before begin(); some ESP32-S3 core/library combinations boot with stale defaults.
+  new (&tft) TFT_eSPI(SCREEN_WIDTH, SCREEN_HEIGHT);
   tft.begin();
-  tft.setRotation(1);
+  tft.setRotation(0);
   tft.fillScreen(TFT_BLACK);
 
   lv_init();
@@ -2920,6 +5274,16 @@ void setup() {
   sdReady = initSdCard();
   if (!sdReady) {
     Serial.println("[SD] init failed");
+  } else {
+    String cacheErr;
+    if (loadCloudCache(cacheErr)) {
+      uiSetCalendarStatus("Loaded cached agenda");
+      uiSetSyncTasksStatus("Loaded cached tasks");
+      uiRefreshCalendarList();
+      uiRefreshSyncTasksList();
+    } else {
+      Serial.println(String("[CACHE] ") + cacheErr);
+    }
   }
 
   if (configuredSsid.length() > 0) {
@@ -2933,6 +5297,14 @@ void setup() {
     setState(AssistantState::Idle, "Set Wi-Fi in Config tab");
   }
 
+  if (WiFi.status() == WL_CONNECTED) {
+    syncClockIfNeeded();
+    String syncErr;
+    if (!syncCloudData(true, syncErr)) {
+      Serial.println(String("[SYNC] initial sync skipped: ") + syncErr);
+    }
+  }
+
   uiRefreshNow();
 }
 
@@ -2944,6 +5316,8 @@ void loop() {
   lv_timer_handler();
   pollBootButton();
   pollHandsFreeTrigger();
+  updatePocketPetLoop(now);
+  maybeRunScheduledCloudSync(now);
 
   if (wifiScanRequested) {
     wifiScanRequested = false;
@@ -2962,9 +5336,24 @@ void loop() {
 
   if (captureRequested) {
     const bool bypassWakeWord = bypassWakeWordForNextCapture;
+    const CaptureMode requestedMode = pendingCaptureMode;
+    activeCaptureMode = requestedMode;
+    pendingCaptureMode = CaptureMode::Assistant;
     bypassWakeWordForNextCapture = false;
     captureRequested = false;
-    runCapturePipeline(bypassWakeWord);
+    runCapturePipeline(bypassWakeWord, requestedMode);
+    activeCaptureMode = CaptureMode::Assistant;
+    uiUpdateTalkButtonLabel();
+    uiUpdateDictateButtonLabel();
+  }
+
+  if (cloudSyncRequested) {
+    cloudSyncRequested = false;
+    String syncErr;
+    if (!syncCloudData(true, syncErr)) {
+      uiSetCalendarStatus("Sync failed: " + clipText(syncErr, 40));
+      uiSetSyncTasksStatus("Sync failed: " + clipText(syncErr, 40));
+    }
   }
 
   if ((now - lastUiPollMs) > 1000) {
@@ -2972,6 +5361,7 @@ void loop() {
     uiUpdateStatus();
   }
   uiUpdateMicLevelLine();
+  checkCalendarAlerts(now);
 
   delay(5);
 }

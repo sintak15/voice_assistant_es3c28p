@@ -67,7 +67,7 @@ static const uint16_t BOOT_LONG_PRESS_MS = 1200;
 // Keep ADC fallback disabled unless you wire an external analog mic.
 static const int PIN_ANALOG_MIC = -1;
 static const uint16_t STT_CONNECT_TIMEOUT_MS = 6000;
-static const uint16_t STT_IO_TIMEOUT_MS = 12000;
+static const uint16_t STT_IO_TIMEOUT_MS = 8000;
 static const uint8_t STT_MAX_RETRIES = 2;
 static const uint32_t MANUAL_CAPTURE_MAX_MS = 8000;
 static const uint32_t DICTATION_CAPTURE_MAX_MS = 5000;
@@ -285,6 +285,11 @@ lv_obj_t* uiLabelBacklightValue = nullptr;
 
 bool backlightPwmReady = false;
 uint8_t backlightPercent = BACKLIGHT_PRESET_HIGH;
+uint32_t lastTouchLogMs = 0;
+uint32_t lastTouchNotReadyLogMs = 0;
+uint32_t touchReadCbCalls = 0;
+uint32_t touchReadCbPresses = 0;
+uint32_t lastTouchCbReportMs = 0;
 
 String notesText;
 
@@ -537,7 +542,12 @@ void applyBacklightPercent(uint8_t percent, bool persist);
 void refreshBacklightUi();
 
 static bool isTapLikeEvent(lv_event_code_t code) {
-  return code == LV_EVENT_CLICKED || code == LV_EVENT_RELEASED;
+  return code == LV_EVENT_CLICKED || code == LV_EVENT_RELEASED || code == LV_EVENT_PRESSED;
+}
+
+static void logUiTap(const char* label) {
+  Serial.print("[UI] tap ");
+  Serial.println(label);
 }
 
 void setState(AssistantState nextState, const String& detail) {
@@ -5048,7 +5058,13 @@ void lvglFlushCb(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p
 
 void lvglTouchReadCb(lv_indev_drv_t* drv, lv_indev_data_t* data) {
   (void)drv;
+  touchReadCbCalls++;
   if (!touchReady) {
+    const uint32_t now = millis();
+    if ((now - lastTouchNotReadyLogMs) > 2000) {
+      lastTouchNotReadyLogMs = now;
+      Serial.println("[TOUCH] not ready");
+    }
     data->state = LV_INDEV_STATE_REL;
     return;
   }
@@ -5060,9 +5076,24 @@ void lvglTouchReadCb(lv_indev_drv_t* drv, lv_indev_data_t* data) {
   }
 
   const TouchPoint mapped = mapTouchToRotation1(raw);
+  touchReadCbPresses++;
   data->state = LV_INDEV_STATE_PR;
   data->point.x = mapped.x;
   data->point.y = mapped.y;
+
+  const uint32_t now = millis();
+  if ((now - lastTouchLogMs) > 160) {
+    lastTouchLogMs = now;
+    Serial.print("[TOUCH] raw(");
+    Serial.print(raw.x);
+    Serial.print(",");
+    Serial.print(raw.y);
+    Serial.print(") mapped(");
+    Serial.print(mapped.x);
+    Serial.print(",");
+    Serial.print(mapped.y);
+    Serial.println(")");
+  }
 }
 
 void uiTalkButtonEventCb(lv_event_t* e) {
@@ -5148,6 +5179,7 @@ void uiOpenSettingsButtonEventCb(lv_event_t* e) {
   if (!isTapLikeEvent(lv_event_get_code(e))) {
     return;
   }
+  logUiTap("open_settings");
   if (uiTabview) {
     lv_tabview_set_act(uiTabview, TAB_INDEX_SETTINGS, LV_ANIM_OFF);
   }
@@ -5157,6 +5189,7 @@ void uiOpenWifiMenuButtonEventCb(lv_event_t* e) {
   if (!isTapLikeEvent(lv_event_get_code(e))) {
     return;
   }
+  logUiTap("open_wifi");
   if (uiTabview) {
     lv_tabview_set_act(uiTabview, TAB_INDEX_WIFI, LV_ANIM_OFF);
   }
@@ -5166,6 +5199,7 @@ void uiOpenPerformanceButtonEventCb(lv_event_t* e) {
   if (!isTapLikeEvent(lv_event_get_code(e))) {
     return;
   }
+  logUiTap("open_performance");
   if (uiTabview) {
     lv_tabview_set_act(uiTabview, TAB_INDEX_PERFORMANCE, LV_ANIM_OFF);
   }
@@ -5176,6 +5210,7 @@ void uiOpenDisplayMenuButtonEventCb(lv_event_t* e) {
   if (!isTapLikeEvent(lv_event_get_code(e))) {
     return;
   }
+  logUiTap("open_display");
   if (uiTabview) {
     lv_tabview_set_act(uiTabview, TAB_INDEX_DISPLAY, LV_ANIM_OFF);
   }
@@ -5279,6 +5314,7 @@ void uiNavHomeButtonEventCb(lv_event_t* e) {
   if (!isTapLikeEvent(lv_event_get_code(e)) || !uiTabview) {
     return;
   }
+  logUiTap("nav_home");
   navIgnoreTabChange = true;
   lv_tabview_set_act(uiTabview, TAB_INDEX_HOME, LV_ANIM_OFF);
   navCurrentTab = TAB_INDEX_HOME;
@@ -5289,6 +5325,7 @@ void uiNavBackButtonEventCb(lv_event_t* e) {
   if (!isTapLikeEvent(lv_event_get_code(e)) || !uiTabview) {
     return;
   }
+  logUiTap("nav_back");
   if (navHistoryCount > 0) {
     const uint16_t target = navHistory[--navHistoryCount];
     navIgnoreTabChange = true;
@@ -5690,7 +5727,7 @@ void buildUi() {
     lv_obj_set_style_bg_opa(btnBack, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_border_width(btnBack, 1, LV_PART_MAIN);
     lv_obj_set_style_border_color(btnBack, lv_color_hex(0x334155), LV_PART_MAIN);
-    lv_obj_add_event_cb(btnBack, uiNavBackButtonEventCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(btnBack, uiNavBackButtonEventCb, LV_EVENT_PRESSED, nullptr);
     lv_obj_t* backLabel = lv_label_create(btnBack);
     lv_label_set_text(backLabel, LV_SYMBOL_LEFT " Back");
     lv_obj_center(backLabel);
@@ -5703,7 +5740,7 @@ void buildUi() {
     lv_obj_set_style_bg_opa(btnHome, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_border_width(btnHome, 1, LV_PART_MAIN);
     lv_obj_set_style_border_color(btnHome, lv_color_hex(0x2DD4BF), LV_PART_MAIN);
-    lv_obj_add_event_cb(btnHome, uiNavHomeButtonEventCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(btnHome, uiNavHomeButtonEventCb, LV_EVENT_PRESSED, nullptr);
     lv_obj_t* homeLabel = lv_label_create(btnHome);
     lv_label_set_text(homeLabel, LV_SYMBOL_HOME " Home");
     lv_obj_center(homeLabel);
@@ -5860,7 +5897,7 @@ void buildUi() {
   uiBtnOpenCalendar = lv_btn_create(grid);
   lv_obj_set_grid_cell(uiBtnOpenCalendar, LV_GRID_ALIGN_STRETCH, 2, 1, LV_GRID_ALIGN_STRETCH, 0, 1);
   styleLauncherTile(uiBtnOpenCalendar, 0xF59E0B);
-  lv_obj_add_event_cb(uiBtnOpenCalendar, uiOpenCalendarButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(uiBtnOpenCalendar, uiOpenCalendarButtonEventCb, LV_EVENT_PRESSED, nullptr);
   lv_obj_t* uiLabelOpenCalendar = lv_label_create(uiBtnOpenCalendar);
   lv_label_set_text(uiLabelOpenCalendar, LV_SYMBOL_BELL " Calendar");
   styleLauncherLabel(uiLabelOpenCalendar, 0xFDE68A);
@@ -5868,7 +5905,7 @@ void buildUi() {
   uiBtnOpenSyncTasks = lv_btn_create(grid);
   lv_obj_set_grid_cell(uiBtnOpenSyncTasks, LV_GRID_ALIGN_STRETCH, 0, 1, LV_GRID_ALIGN_STRETCH, 1, 1);
   styleLauncherTile(uiBtnOpenSyncTasks, 0x38BDF8);
-  lv_obj_add_event_cb(uiBtnOpenSyncTasks, uiOpenSyncTasksButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(uiBtnOpenSyncTasks, uiOpenSyncTasksButtonEventCb, LV_EVENT_PRESSED, nullptr);
   lv_obj_t* uiLabelOpenSyncTasks = lv_label_create(uiBtnOpenSyncTasks);
   lv_label_set_text(uiLabelOpenSyncTasks, LV_SYMBOL_OK " To-Dos");
   styleLauncherLabel(uiLabelOpenSyncTasks, 0x7DD3FC);
@@ -5876,7 +5913,7 @@ void buildUi() {
   uiBtnOpenPet = lv_btn_create(grid);
   lv_obj_set_grid_cell(uiBtnOpenPet, LV_GRID_ALIGN_STRETCH, 1, 1, LV_GRID_ALIGN_STRETCH, 1, 1);
   styleLauncherTile(uiBtnOpenPet, 0x6EE7B7);
-  lv_obj_add_event_cb(uiBtnOpenPet, uiOpenPocketPetButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(uiBtnOpenPet, uiOpenPocketPetButtonEventCb, LV_EVENT_PRESSED, nullptr);
   lv_obj_t* uiLabelOpenPet = lv_label_create(uiBtnOpenPet);
   lv_label_set_text(uiLabelOpenPet, LV_SYMBOL_HOME " Pet");
   styleLauncherLabel(uiLabelOpenPet, 0x6EE7B7);
@@ -5892,7 +5929,7 @@ void buildUi() {
   uiBtnOpenNotes = lv_btn_create(grid);
   lv_obj_set_grid_cell(uiBtnOpenNotes, LV_GRID_ALIGN_STRETCH, 0, 1, LV_GRID_ALIGN_STRETCH, 2, 1);
   styleLauncherTile(uiBtnOpenNotes, 0xF9A8D4);
-  lv_obj_add_event_cb(uiBtnOpenNotes, uiOpenNotesButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(uiBtnOpenNotes, uiOpenNotesButtonEventCb, LV_EVENT_PRESSED, nullptr);
   lv_obj_t* uiLabelOpenNotes = lv_label_create(uiBtnOpenNotes);
   lv_label_set_text(uiLabelOpenNotes, LV_SYMBOL_FILE " Notes");
   styleLauncherLabel(uiLabelOpenNotes, 0xF9A8D4);
@@ -5900,7 +5937,7 @@ void buildUi() {
   uiBtnOpenSettings = lv_btn_create(grid);
   lv_obj_set_grid_cell(uiBtnOpenSettings, LV_GRID_ALIGN_STRETCH, 1, 1, LV_GRID_ALIGN_STRETCH, 2, 1);
   styleLauncherTile(uiBtnOpenSettings, 0xFBBF24);
-  lv_obj_add_event_cb(uiBtnOpenSettings, uiOpenSettingsButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(uiBtnOpenSettings, uiOpenSettingsButtonEventCb, LV_EVENT_PRESSED, nullptr);
   lv_obj_t* uiLabelOpenSettings = lv_label_create(uiBtnOpenSettings);
   lv_label_set_text(uiLabelOpenSettings, LV_SYMBOL_SETTINGS " Settings");
   styleLauncherLabel(uiLabelOpenSettings, 0xFBBF24);
@@ -5926,7 +5963,7 @@ void buildUi() {
   lv_obj_set_style_border_width(settingsWifiBtn, 1, LV_PART_MAIN);
   lv_obj_set_style_border_color(settingsWifiBtn, lv_color_hex(0x60A5FA), LV_PART_MAIN);
   lv_obj_set_style_text_color(settingsWifiBtn, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-  lv_obj_add_event_cb(settingsWifiBtn, uiOpenWifiMenuButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(settingsWifiBtn, uiOpenWifiMenuButtonEventCb, LV_EVENT_PRESSED, nullptr);
   lv_obj_t* settingsWifiLabel = lv_label_create(settingsWifiBtn);
   lv_label_set_text(settingsWifiLabel, LV_SYMBOL_WIFI "  Wi-Fi");
   lv_obj_set_style_text_color(settingsWifiLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
@@ -5941,7 +5978,7 @@ void buildUi() {
   lv_obj_set_style_border_width(settingsPerfBtn, 1, LV_PART_MAIN);
   lv_obj_set_style_border_color(settingsPerfBtn, lv_color_hex(0xA78BFA), LV_PART_MAIN);
   lv_obj_set_style_text_color(settingsPerfBtn, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-  lv_obj_add_event_cb(settingsPerfBtn, uiOpenPerformanceButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(settingsPerfBtn, uiOpenPerformanceButtonEventCb, LV_EVENT_PRESSED, nullptr);
   lv_obj_t* settingsPerfLabel = lv_label_create(settingsPerfBtn);
   lv_label_set_text(settingsPerfLabel, LV_SYMBOL_DRIVE "  Performance");
   lv_obj_set_style_text_color(settingsPerfLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
@@ -5956,7 +5993,7 @@ void buildUi() {
   lv_obj_set_style_border_width(settingsDisplayBtn, 1, LV_PART_MAIN);
   lv_obj_set_style_border_color(settingsDisplayBtn, lv_color_hex(0x67E8F9), LV_PART_MAIN);
   lv_obj_set_style_text_color(settingsDisplayBtn, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-  lv_obj_add_event_cb(settingsDisplayBtn, uiOpenDisplayMenuButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(settingsDisplayBtn, uiOpenDisplayMenuButtonEventCb, LV_EVENT_PRESSED, nullptr);
   lv_obj_t* settingsDisplayLabel = lv_label_create(settingsDisplayBtn);
   lv_label_set_text(settingsDisplayLabel, LV_SYMBOL_EYE_OPEN "  Display / Backlight");
   lv_obj_set_style_text_color(settingsDisplayLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
@@ -5971,7 +6008,7 @@ void buildUi() {
   lv_obj_set_style_border_width(settingsSyncBtn, 1, LV_PART_MAIN);
   lv_obj_set_style_border_color(settingsSyncBtn, lv_color_hex(0x4ADE80), LV_PART_MAIN);
   lv_obj_set_style_text_color(settingsSyncBtn, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-  lv_obj_add_event_cb(settingsSyncBtn, uiSettingsSyncButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(settingsSyncBtn, uiSettingsSyncButtonEventCb, LV_EVENT_PRESSED, nullptr);
   lv_obj_t* settingsSyncLabel = lv_label_create(settingsSyncBtn);
   lv_label_set_text(settingsSyncLabel, LV_SYMBOL_REFRESH "  Sync Now");
   lv_obj_set_style_text_color(settingsSyncLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
@@ -5986,7 +6023,7 @@ void buildUi() {
   lv_obj_set_style_border_width(settingsCalBtn, 1, LV_PART_MAIN);
   lv_obj_set_style_border_color(settingsCalBtn, lv_color_hex(0x5EEAD4), LV_PART_MAIN);
   lv_obj_set_style_text_color(settingsCalBtn, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-  lv_obj_add_event_cb(settingsCalBtn, uiCalibrateMicButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(settingsCalBtn, uiCalibrateMicButtonEventCb, LV_EVENT_PRESSED, nullptr);
   lv_obj_t* settingsCalLabel = lv_label_create(settingsCalBtn);
   lv_label_set_text(settingsCalLabel, LV_SYMBOL_AUDIO "  Calibrate Mic");
   lv_obj_set_style_text_color(settingsCalLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
@@ -6133,7 +6170,7 @@ void buildUi() {
   lv_obj_set_style_radius(backlightLowBtn, 8, LV_PART_MAIN);
   lv_obj_set_style_bg_color(backlightLowBtn, lv_color_hex(0x334155), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(backlightLowBtn, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_add_event_cb(backlightLowBtn, uiBacklightPresetLowEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(backlightLowBtn, uiBacklightPresetLowEventCb, LV_EVENT_PRESSED, nullptr);
   lv_obj_t* backlightLowLabel = lv_label_create(backlightLowBtn);
   lv_label_set_text(backlightLowLabel, "Low");
   lv_obj_center(backlightLowLabel);
@@ -6144,7 +6181,7 @@ void buildUi() {
   lv_obj_set_style_radius(backlightMedBtn, 8, LV_PART_MAIN);
   lv_obj_set_style_bg_color(backlightMedBtn, lv_color_hex(0x1D4ED8), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(backlightMedBtn, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_add_event_cb(backlightMedBtn, uiBacklightPresetMedEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(backlightMedBtn, uiBacklightPresetMedEventCb, LV_EVENT_PRESSED, nullptr);
   lv_obj_t* backlightMedLabel = lv_label_create(backlightMedBtn);
   lv_label_set_text(backlightMedLabel, "Med");
   lv_obj_center(backlightMedLabel);
@@ -6155,7 +6192,7 @@ void buildUi() {
   lv_obj_set_style_radius(backlightHighBtn, 8, LV_PART_MAIN);
   lv_obj_set_style_bg_color(backlightHighBtn, lv_color_hex(0x0F766E), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(backlightHighBtn, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_add_event_cb(backlightHighBtn, uiBacklightPresetHighEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(backlightHighBtn, uiBacklightPresetHighEventCb, LV_EVENT_PRESSED, nullptr);
   lv_obj_t* backlightHighLabel = lv_label_create(backlightHighBtn);
   lv_label_set_text(backlightHighLabel, "High");
   lv_obj_center(backlightHighLabel);
@@ -7008,12 +7045,34 @@ void setup() {
 
 void loop() {
   static uint32_t lastUiPollMs = 0;
+  static uint32_t lastLvTickMs = 0;
   static uint32_t cpuWindowStartMs = 0;
   static uint64_t cpuBusyUsAccum = 0;
   static uint64_t cpuTotalUsAccum = 0;
 
   const uint64_t loopStartUs = micros();
   const uint32_t now = millis();
+#if !LV_TICK_CUSTOM
+  if (lastLvTickMs == 0) {
+    lastLvTickMs = now;
+  }
+  const uint32_t lvElapsedMs = now - lastLvTickMs;
+  if (lvElapsedMs > 0) {
+    lv_tick_inc(lvElapsedMs);
+    lastLvTickMs = now;
+  }
+#else
+  (void)lastLvTickMs;
+#endif
+  if ((now - lastTouchCbReportMs) > 2500) {
+    lastTouchCbReportMs = now;
+    Serial.print("[TOUCHCB] calls=");
+    Serial.print(touchReadCbCalls);
+    Serial.print(" presses=");
+    Serial.print(touchReadCbPresses);
+    Serial.print(" ready=");
+    Serial.println(touchReady ? "1" : "0");
+  }
   if (cpuWindowStartMs == 0) {
     cpuWindowStartMs = now;
   }

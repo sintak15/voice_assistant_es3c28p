@@ -25,15 +25,11 @@ This repository contains active in-progress firmware and board tuning. Core voic
   - `POST /api/conversation/process`
   - `POST /api/tts_get_url`
   - WAV TTS streaming playback with prebuffering
-- Local wake phrase detection on-device (`ok bob`, `okay bob`) via ESP-SR
-- Hands-free fallback VAD trigger mode (optional)
+- Optional hands-free mode using VAD + phrase matching (STT-gated)
 - SD card WAV capture support for debug and validation
 - Daily Calendar dashboard tab with scrollable agenda list
 - Interactive Sync Tasks tab (tap to toggle complete)
-- Pocket Pet tab with TamaPetchi-style simulation controls
 - Offline cache for calendar/tasks on SD (`/voice/dashboard_cache.json`)
-- Core-pinned async TTS playback task with PSRAM ring buffering
-- LVGL double draw-buffering for smoother UI updates during audio/network work
 - Scheduled 6:00 AM sync trigger (local timezone via `DEVICE_TZ`)
 - 10-minute pre-event chime alerts for upcoming appointments
 
@@ -87,8 +83,6 @@ Useful voice settings:
 - `HA_LANGUAGE` (default `en-US`)
 - `HA_TTS_ENGINE_ID` (for example `tts.piper`)
 - `HA_WAKE_PHRASE` (comma-separated phrases, e.g. `ok bob,hey bob`)
-- `ASSISTANT_LOCAL_WAKE_ENABLED` (`1` to run wake phrase on-device with ESP-SR)
-- `ASSISTANT_LOCAL_WAKE_USE_VAD_FALLBACK` (`1` to keep VAD fallback trigger)
 
 Calendar/task dashboard settings:
 - `CLOUD_CALENDAR_EVENTS_URL` (Google Calendar proxy/custom endpoint JSON)
@@ -104,37 +98,23 @@ Calendar/task dashboard settings:
 Use sequential compile then upload (do not skip compile):
 
 ```powershell
-arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=esp_sr_16,PSRAM=opi,FlashMode=qio,USBMode=hwcdc,CDCOnBoot=cdc" \
+arduino-cli compile --fqbn esp32:esp32:esp32s3 \
   --build-path .\\build .
 
-arduino-cli upload --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=esp_sr_16,PSRAM=opi,FlashMode=qio,USBMode=hwcdc,CDCOnBoot=cdc" \
+arduino-cli upload --fqbn esp32:esp32:esp32s3 \
   --port COM10 --input-dir .\\build .
 ```
 
-The ESP-SR model blob must also be in the build folder before upload:
-
-```powershell
-Copy-Item -Force `
-  "$env:LOCALAPPDATA\\Arduino15\\packages\\esp32\\tools\\esp32s3-libs\\3.3.7\\esp_sr\\srmodels.bin" `
-  ".\\build\\srmodels.bin"
-```
-
-Convenience script (compile + model copy + upload):
-
-```powershell
-.\flash_sr.ps1 -Port COM10
-```
+If your board requires custom menu options (flash size, PSRAM mode, USB CDC), append them to `--fqbn` as needed.
 
 ## Runtime Controls
 
 - UI `Listen` button: starts capture/assistant request
 - UI `Stop` button (same control while active): requests cancellation
-- Hands-free local wake: say `ok bob` or `okay bob`
 - Touch + status labels expose current assistant state and diagnostics
-- Launcher tiles open `Calendar`, `To-Dos`, `Pocket Pet`, `Notes`, and `Settings`
-- `Settings` contains `Wi-Fi`, `Performance`, and `Sync Now`
+- Launcher tiles open `Calendar`, `To-Dos`, `Pocket Pet`, `Notes`, `Queue`, and `Wi-Fi`
+- `Sync` tile/manual buttons fetch cloud calendar/tasks and refresh local cache
 - Tap items in `Sync Tasks` to check/uncheck and send webhook updates
-- Pocket Pet actions: `Feed`, `Play`, `Clean`, `Sleep/Wake`, `Heal`, `Reset`
 
 ## Troubleshooting
 
@@ -149,9 +129,8 @@ Convenience script (compile + model copy + upload):
 - Check payload format/provider expectations in Home Assistant logs.
 
 ### Wake phrase does not trigger
-- Local wake runs on-device (ESP-SR) for `ok bob` / `okay bob`.
-- Ensure `PartitionScheme=esp_sr_16` (or compatible ESP-SR partition) and flash `srmodels.bin`.
-- If you need old behavior as backup, set `ASSISTANT_LOCAL_WAKE_USE_VAD_FALLBACK` to `1`.
+- Current hands-free mode is STT/VAD-gated phrase matching, not a dedicated on-device wake-word engine.
+- Validate phrase list formatting in `HA_WAKE_PHRASE`.
 
 ### Calendar or tasks do not load
 - Confirm endpoint URLs in `secrets.h` return JSON arrays (or `{ "items": [...] }`).
@@ -189,7 +168,6 @@ Hardware and integration decisions were informed by these sources (accessed duri
 9. Home Assistant community troubleshooting thread: https://community.home-assistant.io/t/mostly-working-config-for-cheap-18-2-8-esp32-s3-touchscreen-with-speaker-and-mic/965950
 10. Home Assistant wake-word troubleshooting thread: https://community.home-assistant.io/t/solved-micro-wake-word-not-working-on-esp32-s3-e-g-seed-studio-xiao-sense-esp32-s3-sense/873638
 11. ESP32-2432S028 spec mirror PDF: https://github.com/witnessmenow/ESP32-Cheap-Yellow-Display/blob/main/OriginalDocumentation/2-Specification/ESP32-2432S028%20Specifications-EN.pdf
-12. ESP32-TamaPetchi reference project (MIT): https://github.com/CyberXcyborg/ESP32-TamaPetchi
 
 ## Licensing
 

@@ -1,3 +1,4 @@
+#line 1 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\i2s_mic_capture.h"
 #pragma once
 
 #include <Arduino.h>

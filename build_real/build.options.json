@@ -1,11 +1,9 @@
 {
-  "additionalFiles": "..\\..\\..,..\\..,..\\..,..\\..,..\\..,..\\..\\..,..\\..\\..,..\\..\\..,..\\..\\..\\..\\..,..\\..\\..\\..,..\\..\\..\\..,..\\..\\..\\..,..\\..\\..\\..,..\\..\\..\\..\\..,..\\..\\..\\..\\..,..\\..\\..\\..,..\\..,..\\..,..\\..,..\\..,..\\..,..\\..",
-  "builtInToolsFolders": "",
+  "additionalFiles": "..\\..\\..,..\\..,..\\..,..\\..,..\\..,..\\..,..\\..,..\\..,..\\..,..\\..,..\\..",
   "compiler.optimization_flags": "-Os",
   "customBuildProperties": "",
   "fqbn": "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,FlashMode=qio,USBMode=hwcdc,CDCOnBoot=cdc",
-  "hardwareFolders": "C:\\Users\\Justin\\AppData\\Local\\Arduino15\\packages",
+  "hardwareFolders": "C:\\Users\\Justin\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.7,C:\\Users\\Justin\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.7",
   "otherLibrariesFolders": "C:\\Users\\Justin\\Documents\\Arduino\\libraries",
-  "runtime.ide.version": "10607",
   "sketchLocation": "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p"
 }

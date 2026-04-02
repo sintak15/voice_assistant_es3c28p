@@ -1,3 +1,4 @@
+#line 1 "C:\\Users\\Justin\\Documents\\Arduino\\voice_assistant_es3c28p\\secrets.example.h"
 #pragma once
 
 // Copy this file to secrets.h and set your values there.

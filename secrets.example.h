@@ -48,6 +48,14 @@
 #define ASSISTANT_ENABLE_HANDS_FREE 1
 #endif
 
+#ifndef ASSISTANT_LOCAL_WAKE_ENABLED
+#define ASSISTANT_LOCAL_WAKE_ENABLED 1
+#endif
+
+#ifndef ASSISTANT_LOCAL_WAKE_USE_VAD_FALLBACK
+#define ASSISTANT_LOCAL_WAKE_USE_VAD_FALLBACK 0
+#endif
+
 #ifndef ASSISTANT_VAD_TRIGGER_RMS
 #define ASSISTANT_VAD_TRIGGER_RMS 0.015f
 #endif
@@ -68,6 +76,10 @@
 //   /api/calendars/<entity>?start=<utc>&end=<utc>
 #ifndef HA_CALENDAR_ENTITY_ID
 #define HA_CALENDAR_ENTITY_ID ""
+#endif
+
+#ifndef HA_TODO_ENTITY_ID
+#define HA_TODO_ENTITY_ID ""
 #endif
 
 // Tasks endpoint should return an array or an object with `items` containing:

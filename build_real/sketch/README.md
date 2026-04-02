@@ -8,6 +8,7 @@ This project focuses on:
 - Microphone capture and voice activity diagnostics
 - Home Assistant STT -> conversation -> TTS loop
 - On-device playback through ES8311 + I2S speaker path
+- Calendar + task dashboard workflows with offline cache
 
 ## Status
 
@@ -15,7 +16,7 @@ This repository contains active in-progress firmware and board tuning. Core voic
 
 ## Features
 
-- LVGL + TFT_eSPI UI on 320x240 ILI9341 display
+- LVGL + TFT_eSPI UI on 240x320 portrait ILI9341 display
 - Touch controls (FT6336) with a `Listen`/`Stop` talk button
 - Wi-Fi onboarding controls in UI (scan/save/connect)
 - 16 kHz mono PCM microphone capture via ES8311/I2S
@@ -27,6 +28,11 @@ This repository contains active in-progress firmware and board tuning. Core voic
   - WAV TTS streaming playback with prebuffering
 - Optional hands-free mode using VAD + phrase matching (STT-gated)
 - SD card WAV capture support for debug and validation
+- Daily Calendar dashboard tab with scrollable agenda list
+- Interactive Sync Tasks tab (tap to toggle complete)
+- Offline cache for calendar/tasks on SD (`/voice/dashboard_cache.json`)
+- Scheduled 6:00 AM sync trigger (local timezone via `DEVICE_TZ`)
+- 10-minute pre-event chime alerts for upcoming appointments
 
 ## Repository Layout
 
@@ -79,6 +85,15 @@ Useful voice settings:
 - `HA_TTS_ENGINE_ID` (for example `tts.piper`)
 - `HA_WAKE_PHRASE` (comma-separated phrases, e.g. `ok bob,hey bob`)
 
+Calendar/task dashboard settings:
+- `CLOUD_CALENDAR_EVENTS_URL` (Google Calendar proxy/custom endpoint JSON)
+- `HA_CALENDAR_ENTITY_ID` (optional Home Assistant calendar fallback)
+- `CLOUD_TASKS_LIST_URL` (Google Tasks proxy/custom endpoint JSON)
+- `CLOUD_TASK_COMPLETE_WEBHOOK_URL` (for completion updates)
+- `CLOUD_API_BEARER_TOKEN` (optional bearer token for cloud endpoints)
+- `CLOUD_SYNC_DAYS_AHEAD` (default `3`)
+- `DEVICE_TZ` (POSIX timezone string for local rendering + 6:00 sync)
+
 ## Build and Flash (Recommended CLI Flow)
 
 Use sequential compile then upload (do not skip compile):
@@ -98,6 +113,9 @@ If your board requires custom menu options (flash size, PSRAM mode, USB CDC), ap
 - UI `Listen` button: starts capture/assistant request
 - UI `Stop` button (same control while active): requests cancellation
 - Touch + status labels expose current assistant state and diagnostics
+- Launcher tiles open `Calendar`, `To-Dos`, `Pocket Pet`, `Notes`, `Queue`, and `Wi-Fi`
+- `Sync` tile/manual buttons fetch cloud calendar/tasks and refresh local cache
+- Tap items in `Sync Tasks` to check/uncheck and send webhook updates
 
 ## Troubleshooting
 
@@ -114,6 +132,12 @@ If your board requires custom menu options (flash size, PSRAM mode, USB CDC), ap
 ### Wake phrase does not trigger
 - Current hands-free mode is STT/VAD-gated phrase matching, not a dedicated on-device wake-word engine.
 - Validate phrase list formatting in `HA_WAKE_PHRASE`.
+
+### Calendar or tasks do not load
+- Confirm endpoint URLs in `secrets.h` return JSON arrays (or `{ "items": [...] }`).
+- If using private Google APIs, use a secure proxy/webhook that adds OAuth server-side.
+- If using Home Assistant calendar fallback, set `HA_CALENDAR_ENTITY_ID`.
+- Check `DEVICE_TZ` for correct local times and 6:00 AM scheduled sync behavior.
 
 ### TTS plays but sounds delayed/choppy
 - Check Wi-Fi quality and Home Assistant host load.

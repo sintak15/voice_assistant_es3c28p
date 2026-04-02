@@ -219,6 +219,14 @@ class I2SMicCapture {
     return true;
   }
 
+  bool prepareCaptureClock() {
+    if (!ready_) {
+      return false;
+    }
+    setAudioEnable(false);
+    return setClock(sampleRate_, I2S_CHANNEL_STEREO, I2S_BITS_PER_SAMPLE_16BIT);
+  }
+
   static CaptureMetrics analyze(const int16_t* samples, size_t count) {
     CaptureMetrics result{};
     if (!samples || count == 0) {
@@ -244,6 +252,7 @@ class I2SMicCapture {
   }
 
   uint32_t sampleRate() const { return sampleRate_; }
+  i2s_port_t port() const { return port_; }
 
  private:
   static int16_t unpackI2SSample16(int32_t raw) {

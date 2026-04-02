@@ -18,6 +18,24 @@ struct CaptureMetrics {
   size_t samples = 0;
 };
 
+struct CaptureVadConfig {
+  float startRmsNorm = 0.012f;
+  float stopRmsNorm = 0.007f;
+  uint16_t frameMs = 20;
+  uint16_t maxWaitMs = 2200;
+  uint16_t trailingSilenceMs = 900;
+  uint16_t minSpeechMs = 280;
+  uint16_t preRollMs = 260;
+};
+
+struct CaptureResult {
+  CaptureMetrics metrics{};
+  size_t sampleCount = 0;
+  bool speechDetected = false;
+  bool timedOutWaitingSpeech = false;
+  uint32_t speechMs = 0;
+};
+
 class I2SMicCapture {
  public:
   bool begin(Es8311Codec& codec, uint32_t sampleRate = 16000) {
@@ -131,6 +149,190 @@ class I2SMicCapture {
     }
 
     metrics = analyze(out, captured);
+    return true;
+  }
+
+  bool captureVoiceCommand(int16_t* out, size_t maxSamples, const CaptureVadConfig& config, CaptureResult& outResult) {
+    outResult = CaptureResult{};
+    if (!ready_ || !out || maxSamples == 0) {
+      return false;
+    }
+
+    setAudioEnable(false);
+    if (!setClock(sampleRate_, I2S_CHANNEL_STEREO, I2S_BITS_PER_SAMPLE_16BIT)) {
+      return false;
+    }
+
+    static const size_t kMaxFrameSamples = 640;
+    static const size_t kPreRollMaxSamples = 8192;
+    int16_t stereoSamples[kMaxFrameSamples * 2] = {0};
+    int16_t monoFrame[kMaxFrameSamples] = {0};
+    static int16_t preRollBuffer[kPreRollMaxSamples];
+
+    uint16_t frameMs = config.frameMs;
+    if (frameMs < 10) {
+      frameMs = 10;
+    }
+    if (frameMs > 40) {
+      frameMs = 40;
+    }
+
+    size_t frameSamples = (static_cast<size_t>(sampleRate_) * frameMs) / 1000;
+    if (frameSamples < 80) {
+      frameSamples = 80;
+    }
+    if (frameSamples > kMaxFrameSamples) {
+      frameSamples = kMaxFrameSamples;
+    }
+
+    const uint16_t waitFrames =
+        static_cast<uint16_t>((static_cast<uint32_t>(config.maxWaitMs) + frameMs - 1) / frameMs);
+    uint16_t trailingSilenceFrames =
+        static_cast<uint16_t>((static_cast<uint32_t>(config.trailingSilenceMs) + frameMs - 1) / frameMs);
+    uint16_t minSpeechFrames =
+        static_cast<uint16_t>((static_cast<uint32_t>(config.minSpeechMs) + frameMs - 1) / frameMs);
+    if (trailingSilenceFrames < 1) {
+      trailingSilenceFrames = 1;
+    }
+    if (minSpeechFrames < 1) {
+      minSpeechFrames = 1;
+    }
+
+    size_t preRollSamples = (static_cast<size_t>(sampleRate_) * config.preRollMs) / 1000;
+    if (preRollSamples > maxSamples / 2) {
+      preRollSamples = maxSamples / 2;
+    }
+    if (preRollSamples > kPreRollMaxSamples) {
+      preRollSamples = kPreRollMaxSamples;
+    }
+
+    size_t preRollWrite = 0;
+    size_t preRollCount = 0;
+    size_t captured = 0;
+    bool speechStarted = false;
+    uint16_t waitedFrames = 0;
+    uint16_t voicedFrames = 0;
+    uint16_t silenceFrames = 0;
+
+    const float voiceRmsStart = config.startRmsNorm > 0.001f ? config.startRmsNorm : 0.001f;
+    const float voiceRmsStop = config.stopRmsNorm > 0.0005f ? config.stopRmsNorm : 0.0005f;
+    const float voicePeakStartBase = voiceRmsStart * 2.7f;
+    const float voicePeakStopBase = voiceRmsStop * 2.7f;
+    float noiseRmsEma = 0.0f;
+    uint16_t noiseFrames = 0;
+    float dynamicStopRms = voiceRmsStop;
+    float dynamicStopPeak = voicePeakStopBase;
+
+    while (captured < maxSamples) {
+      const size_t bytesToRead = frameSamples * sizeof(int16_t) * 2;
+      size_t bytesRead = 0;
+      const esp_err_t err = i2s_read(
+          port_,
+          reinterpret_cast<void*>(stereoSamples),
+          bytesToRead,
+          &bytesRead,
+          pdMS_TO_TICKS(700));
+      if (err != ESP_OK || bytesRead == 0) {
+        return false;
+      }
+
+      const size_t framesRead = bytesRead / (sizeof(int16_t) * 2);
+      if (framesRead == 0) {
+        return false;
+      }
+
+      for (size_t i = 0; i < framesRead; ++i) {
+        const int16_t left = stereoSamples[i * 2];
+        const int16_t right = stereoSamples[i * 2 + 1];
+        const int32_t absLeft = left < 0 ? -static_cast<int32_t>(left) : static_cast<int32_t>(left);
+        const int32_t absRight = right < 0 ? -static_cast<int32_t>(right) : static_cast<int32_t>(right);
+        monoFrame[i] = absLeft >= absRight ? left : right;
+      }
+
+      const CaptureMetrics frameMetrics = analyze(monoFrame, framesRead);
+      if (!speechStarted) {
+        if (noiseFrames == 0) {
+          noiseRmsEma = frameMetrics.rmsNorm;
+        } else {
+          noiseRmsEma = (noiseRmsEma * 0.90f) + (frameMetrics.rmsNorm * 0.10f);
+        }
+        noiseFrames++;
+      }
+
+      const float adaptiveStartRms = noiseRmsEma * 2.2f;
+      const float dynamicStartRms = adaptiveStartRms > voiceRmsStart ? adaptiveStartRms : voiceRmsStart;
+      const float dynamicStartPeak = dynamicStartRms * 2.7f;
+      const bool frameHasVoice =
+          frameMetrics.rmsNorm >= dynamicStartRms ||
+          frameMetrics.peakNorm >= dynamicStartPeak ||
+          frameMetrics.peakNorm >= voicePeakStartBase;
+      const bool frameAboveStop =
+          frameMetrics.rmsNorm >= dynamicStopRms ||
+          frameMetrics.peakNorm >= dynamicStopPeak;
+
+      if (!speechStarted) {
+        if (frameHasVoice) {
+          speechStarted = true;
+          dynamicStopRms = voiceRmsStop;
+          const float adaptiveStop = noiseRmsEma * 1.35f;
+          if (adaptiveStop > dynamicStopRms) {
+            dynamicStopRms = adaptiveStop;
+          }
+          dynamicStopPeak = dynamicStopRms * 2.7f;
+          if (dynamicStopPeak < voicePeakStopBase) {
+            dynamicStopPeak = voicePeakStopBase;
+          }
+          if (preRollCount > 0) {
+            const size_t start = (preRollWrite + preRollSamples - preRollCount) % preRollSamples;
+            for (size_t i = 0; i < preRollCount && captured < maxSamples; ++i) {
+              out[captured++] = preRollBuffer[(start + i) % preRollSamples];
+            }
+          }
+        } else {
+          if (preRollSamples > 0) {
+            for (size_t i = 0; i < framesRead; ++i) {
+              preRollBuffer[preRollWrite] = monoFrame[i];
+              preRollWrite = (preRollWrite + 1) % preRollSamples;
+              if (preRollCount < preRollSamples) {
+                preRollCount++;
+              }
+            }
+          }
+
+          waitedFrames++;
+          if (waitedFrames >= waitFrames) {
+            outResult.metrics = CaptureMetrics{};
+            outResult.sampleCount = 0;
+            outResult.speechDetected = false;
+            outResult.timedOutWaitingSpeech = true;
+            outResult.speechMs = 0;
+            return true;
+          }
+          continue;
+        }
+      }
+
+      for (size_t i = 0; i < framesRead && captured < maxSamples; ++i) {
+        out[captured++] = monoFrame[i];
+      }
+
+      if (frameAboveStop) {
+        voicedFrames++;
+        silenceFrames = 0;
+      } else if (voicedFrames > 0) {
+        silenceFrames++;
+      }
+
+      if (voicedFrames >= minSpeechFrames && silenceFrames >= trailingSilenceFrames) {
+        break;
+      }
+    }
+
+    outResult.metrics = analyze(out, captured);
+    outResult.sampleCount = captured;
+    outResult.speechDetected = speechStarted && captured > 0;
+    outResult.timedOutWaitingSpeech = !speechStarted;
+    outResult.speechMs = static_cast<uint32_t>((captured * 1000ULL) / sampleRate_);
     return true;
   }
 

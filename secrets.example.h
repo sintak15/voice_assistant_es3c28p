@@ -64,6 +64,35 @@
 #define ASSISTANT_VAD_TRIGGER_FRAMES 3
 #endif
 
+// Advanced capture + VAD tuning for PSRAM-backed AI voice loops.
+#ifndef ASSISTANT_CAPTURE_MAX_SECONDS
+#define ASSISTANT_CAPTURE_MAX_SECONDS 18
+#endif
+
+#ifndef ASSISTANT_VAD_START_RMS
+#define ASSISTANT_VAD_START_RMS 0.012f
+#endif
+
+#ifndef ASSISTANT_VAD_STOP_RMS
+#define ASSISTANT_VAD_STOP_RMS 0.007f
+#endif
+
+#ifndef ASSISTANT_VAD_TRAILING_SILENCE_MS
+#define ASSISTANT_VAD_TRAILING_SILENCE_MS 900
+#endif
+
+#ifndef ASSISTANT_VAD_MAX_WAIT_MS
+#define ASSISTANT_VAD_MAX_WAIT_MS 2200
+#endif
+
+#ifndef ASSISTANT_VAD_MIN_SPEECH_MS
+#define ASSISTANT_VAD_MIN_SPEECH_MS 280
+#endif
+
+#ifndef ASSISTANT_VAD_PREROLL_MS
+#define ASSISTANT_VAD_PREROLL_MS 260
+#endif
+
 // Cloud dashboard integration (Google Calendar/Tasks or any compatible JSON endpoint)
 // Calendar endpoint should return an array or an object with `items` containing:
 //   id, summary/title, start{dateTime|date}, end{dateTime|date}

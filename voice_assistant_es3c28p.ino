@@ -9,6 +9,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Wire.h>
+#include <esp_heap_caps.h>
 #include <cstring>
 
 #include "board_pins.h"
@@ -32,6 +33,34 @@ enum class AssistantState {
 
 static const uint16_t SCREEN_WIDTH = 240;
 static const uint16_t SCREEN_HEIGHT = 320;
+
+#ifndef ASSISTANT_CAPTURE_MAX_SECONDS
+#define ASSISTANT_CAPTURE_MAX_SECONDS 18
+#endif
+
+#ifndef ASSISTANT_VAD_START_RMS
+#define ASSISTANT_VAD_START_RMS 0.012f
+#endif
+
+#ifndef ASSISTANT_VAD_STOP_RMS
+#define ASSISTANT_VAD_STOP_RMS 0.007f
+#endif
+
+#ifndef ASSISTANT_VAD_TRAILING_SILENCE_MS
+#define ASSISTANT_VAD_TRAILING_SILENCE_MS 900
+#endif
+
+#ifndef ASSISTANT_VAD_MAX_WAIT_MS
+#define ASSISTANT_VAD_MAX_WAIT_MS 2200
+#endif
+
+#ifndef ASSISTANT_VAD_MIN_SPEECH_MS
+#define ASSISTANT_VAD_MIN_SPEECH_MS 280
+#endif
+
+#ifndef ASSISTANT_VAD_PREROLL_MS
+#define ASSISTANT_VAD_PREROLL_MS 260
+#endif
 
 static const uint32_t CAPTURE_SAMPLE_RATE = 16000;
 static const uint16_t CAPTURE_SECONDS = 4;
@@ -83,6 +112,12 @@ static uint32_t lastUiDrawMs = 0;
 static int16_t captureBufferStorage[CAPTURE_SAMPLES] = {0};
 static int16_t* captureBuffer = captureBufferStorage;
 static size_t captureBufferCapacity = CAPTURE_SAMPLES;
+static bool captureBufferInPsram = false;
+static size_t lastCaptureSamples = 0;
+static uint32_t lastCaptureMs = 0;
+static float lastCaptureRms = 0.0f;
+static float lastCapturePeak = 0.0f;
+static String haConversationId;
 
 String clipText(const String& text, size_t maxLen) {
   if (text.length() <= maxLen) {
@@ -92,6 +127,26 @@ String clipText(const String& text, size_t maxLen) {
     return text.substring(0, maxLen);
   }
   return text.substring(0, maxLen - 3) + "...";
+}
+
+void logMemoryStats(const char* phase) {
+  const size_t internalFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  const size_t internalLargest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  Serial.println(
+      String("[MEM] ") + phase +
+      " | int_free=" + internalFree +
+      " int_largest=" + internalLargest);
+
+  if (psramFound()) {
+    const size_t psramTotal = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    const size_t psramFree = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    const size_t psramLargest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    Serial.println(
+        String("[MEM] ") + phase +
+        " | psram_free=" + psramFree +
+        " psram_largest=" + psramLargest +
+        " psram_total=" + psramTotal);
+  }
 }
 
 String trimmedConfig(const char* value) {
@@ -201,6 +256,14 @@ void drawScreen(bool force) {
 
   tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
   tft.drawString("Press BOOT for capture", 8, 288, 2);
+
+  if (lastCaptureSamples > 0) {
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    const String capInfo =
+        String("Last cap ") + String(lastCaptureMs / 1000.0f, 2) +
+        "s pk " + String(lastCapturePeak * 100.0f, 1) + "%";
+    tft.drawString(clipText(capInfo, 42), 8, 270, 2);
+  }
 }
 
 void setState(AssistantState nextState, const String& detail) {
@@ -875,6 +938,9 @@ bool homeAssistantConversation(const String& text, String& outReply, String& out
   if (strlen(HA_AGENT_ID) > 0) {
     req["agent_id"] = HA_AGENT_ID;
   }
+  if (haConversationId.length() > 0) {
+    req["conversation_id"] = haConversationId;
+  }
 
   String body;
   serializeJson(req, body);
@@ -898,6 +964,12 @@ bool homeAssistantConversation(const String& text, String& outReply, String& out
   if (deserializeJson(doc, response)) {
     outError = "Conversation JSON parse failed";
     return false;
+  }
+
+  String nextConversationId = doc["conversation_id"] | "";
+  nextConversationId.trim();
+  if (nextConversationId.length() > 0) {
+    haConversationId = nextConversationId;
   }
 
   outReply = doc["response"]["speech"]["plain"]["speech"] | "";
@@ -1292,15 +1364,48 @@ void runAssistantCycle() {
   setState(AssistantState::Listening, "Capturing audio");
   drawScreen(true);
 
-  const size_t captureSamples = captureBufferCapacity < CAPTURE_SAMPLES ? captureBufferCapacity : CAPTURE_SAMPLES;
-  CaptureMetrics metrics;
-  if (!micCapture.captureBlocking(captureBuffer, captureSamples, metrics)) {
+  size_t captureMaxSamples = captureBufferCapacity;
+  const size_t configuredMaxSamples =
+      static_cast<size_t>(CAPTURE_SAMPLE_RATE) * static_cast<size_t>(ASSISTANT_CAPTURE_MAX_SECONDS);
+  if (configuredMaxSamples > 0 && configuredMaxSamples < captureMaxSamples) {
+    captureMaxSamples = configuredMaxSamples;
+  }
+  if (captureMaxSamples < CAPTURE_SAMPLE_RATE / 2) {
+    captureMaxSamples = CAPTURE_SAMPLE_RATE / 2;
+  }
+
+  CaptureVadConfig vad;
+  vad.startRmsNorm = ASSISTANT_VAD_START_RMS;
+  vad.stopRmsNorm = ASSISTANT_VAD_STOP_RMS;
+  vad.frameMs = 20;
+  vad.maxWaitMs = ASSISTANT_VAD_MAX_WAIT_MS;
+  vad.trailingSilenceMs = ASSISTANT_VAD_TRAILING_SILENCE_MS;
+  vad.minSpeechMs = ASSISTANT_VAD_MIN_SPEECH_MS;
+  vad.preRollMs = ASSISTANT_VAD_PREROLL_MS;
+
+  CaptureResult captureResult;
+  if (!micCapture.captureVoiceCommand(captureBuffer, captureMaxSamples, vad, captureResult)) {
     setState(AssistantState::Error, "Microphone capture failed");
     return;
   }
 
-  if (metrics.rmsNorm < CAPTURE_MIN_RMS && metrics.peakNorm < CAPTURE_MIN_PEAK) {
+  lastCaptureSamples = captureResult.sampleCount;
+  lastCaptureMs = captureResult.speechMs;
+  lastCaptureRms = captureResult.metrics.rmsNorm;
+  lastCapturePeak = captureResult.metrics.peakNorm;
+  Serial.println(
+      String("[MIC] samples=") + lastCaptureSamples +
+      " ms=" + lastCaptureMs +
+      " rms=" + String(lastCaptureRms, 4) +
+      " peak=" + String(lastCapturePeak, 4));
+
+  if (!captureResult.speechDetected || captureResult.sampleCount == 0) {
     setState(AssistantState::Idle, "No speech detected");
+    return;
+  }
+  if (captureResult.metrics.rmsNorm < CAPTURE_MIN_RMS &&
+      captureResult.metrics.peakNorm < CAPTURE_MIN_PEAK) {
+    setState(AssistantState::Idle, "Speech too quiet");
     return;
   }
 
@@ -1309,7 +1414,7 @@ void runAssistantCycle() {
 
   String transcript;
   String sttErr;
-  if (!homeAssistantStt(captureBuffer, captureSamples, transcript, sttErr)) {
+  if (!homeAssistantStt(captureBuffer, captureResult.sampleCount, transcript, sttErr)) {
     setState(AssistantState::Error, "STT failed: " + clipText(sttErr, 54));
     return;
   }
@@ -1379,16 +1484,38 @@ void setup() {
   if (!audioReady) {
     setState(AssistantState::Error, "Audio init failed");
   }
+  logMemoryStats("boot");
 
   if (psramFound()) {
-    const size_t desiredSamples = CAPTURE_SAMPLE_RATE * 6;
-    int16_t* psramCapture = static_cast<int16_t*>(ps_malloc(desiredSamples * sizeof(int16_t)));
+    const size_t psramFree = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    const size_t reserveBytes = 1024 * 1024;
+    const size_t preferredSamples =
+        static_cast<size_t>(CAPTURE_SAMPLE_RATE) * static_cast<size_t>(ASSISTANT_CAPTURE_MAX_SECONDS);
+    size_t targetBytes = preferredSamples * sizeof(int16_t);
+    const size_t usableBytes = psramFree > reserveBytes ? (psramFree - reserveBytes) : (psramFree / 2);
+    if (targetBytes > usableBytes) {
+      targetBytes = usableBytes;
+    }
+    targetBytes -= (targetBytes % sizeof(int16_t));
+
+    int16_t* psramCapture = nullptr;
+    if (targetBytes >= (CAPTURE_SAMPLES * sizeof(int16_t) * 2)) {
+      psramCapture = static_cast<int16_t*>(ps_malloc(targetBytes));
+    }
     if (psramCapture) {
       captureBuffer = psramCapture;
-      captureBufferCapacity = desiredSamples;
-      Serial.println(String("[MIC] PSRAM capture samples=") + captureBufferCapacity);
+      captureBufferCapacity = targetBytes / sizeof(int16_t);
+      captureBufferInPsram = true;
+      Serial.println(
+          String("[MIC] PSRAM capture samples=") + captureBufferCapacity +
+          " seconds=" + String(captureBufferCapacity / static_cast<float>(CAPTURE_SAMPLE_RATE), 1));
     }
   }
+  Serial.println(
+      String("[AI] capture_mode=VAD max_seconds=") +
+      String(captureBufferCapacity / static_cast<float>(CAPTURE_SAMPLE_RATE), 1) +
+      " psram=" + (captureBufferInPsram ? "yes" : "no"));
+  logMemoryStats("post-buffer");
 
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);

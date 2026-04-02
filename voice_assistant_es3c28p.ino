@@ -99,6 +99,10 @@ static const size_t MAX_CALENDAR_EVENTS = 20;
 static const size_t MAX_SYNC_TASKS = 24;
 static const uint16_t CALENDAR_ALERT_LEAD_MINUTES = 10;
 static const uint32_t CLOUD_SYNC_RETRY_MS = 5UL * 60UL * 1000UL;
+static const uint32_t WIFI_MONITOR_POLL_MS = 800;
+static const uint32_t WIFI_RECONNECT_BASE_DELAY_MS = 2000;
+static const uint32_t WIFI_RECONNECT_MAX_DELAY_MS = 60000;
+static const uint32_t WIFI_RECONNECT_ATTEMPT_TIMEOUT_MS = 8000;
 static const size_t MAX_TODO_ENTITY_OPTIONS = 12;
 static const lv_coord_t NAV_BAR_HEIGHT = 44;
 static const lv_coord_t NAV_CLEARANCE = 52;
@@ -224,7 +228,15 @@ unsigned long bootPressStartMs = 0;
 
 String configuredSsid;
 String configuredPassword;
+String reconnectSsid;
+String reconnectPassword;
 String configuredTodoEntity;
+bool wifiReconnectPending = false;
+uint8_t wifiReconnectFailures = 0;
+uint32_t wifiNextReconnectAtMs = 0;
+uint32_t wifiLastMonitorMs = 0;
+uint32_t wifiLastConnectedAtMs = 0;
+wl_status_t wifiLastStatus = WL_IDLE_STATUS;
 
 int16_t captureBufferStorage[CAPTURE_SAMPLES] = {0};
 int16_t* captureBuffer = captureBufferStorage;
@@ -482,6 +494,8 @@ void maybeRunScheduledCloudSync(uint32_t nowMs);
 void checkCalendarAlerts(uint32_t nowMs);
 bool playAlertChime();
 void syncClockIfNeeded();
+void runPostWifiConnectTasks(const char* sourceTag);
+void pollWifiResilience(uint32_t nowMs);
 bool fetchSyncedTasksFromHomeAssistant(String& outError);
 bool updateTodoItemInHomeAssistant(const SyncedTaskItem& task, bool completed, String& outError);
 String activeTodoEntity();
@@ -4629,12 +4643,90 @@ bool homeAssistantPlayTtsWav(const String& ttsUrl, String& outError) {
   return ok;
 }
 
+static uint32_t wifiReconnectBackoffMs(uint8_t consecutiveFailures) {
+  uint8_t exponent = consecutiveFailures > 0 ? static_cast<uint8_t>(consecutiveFailures - 1) : 0;
+  if (exponent > 5) {
+    exponent = 5;
+  }
+
+  uint32_t delayMs = WIFI_RECONNECT_BASE_DELAY_MS;
+  while (exponent > 0 && delayMs < WIFI_RECONNECT_MAX_DELAY_MS) {
+    if (delayMs > (WIFI_RECONNECT_MAX_DELAY_MS / 2)) {
+      delayMs = WIFI_RECONNECT_MAX_DELAY_MS;
+      break;
+    }
+    delayMs *= 2;
+    exponent--;
+  }
+  if (delayMs > WIFI_RECONNECT_MAX_DELAY_MS) {
+    delayMs = WIFI_RECONNECT_MAX_DELAY_MS;
+  }
+  return delayMs;
+}
+
+static void scheduleWifiReconnect(uint32_t nowMs, bool immediate, const String& reason) {
+  if (reconnectSsid.length() == 0) {
+    wifiReconnectPending = false;
+    return;
+  }
+
+  const uint32_t delayMs = immediate ? 1000 : wifiReconnectBackoffMs(wifiReconnectFailures);
+  wifiReconnectPending = true;
+  wifiNextReconnectAtMs = nowMs + delayMs;
+
+  const uint32_t waitSec = (delayMs + 999) / 1000;
+  uiSetWifiMenuStatus(String("Wi-Fi retry #") + String(wifiReconnectFailures + 1) + " in " + String(waitSec) + "s");
+  Serial.println(String("[WIFI] reconnect scheduled in ") + String(delayMs) + " ms"
+                 + (reason.length() > 0 ? String(" | ") + reason : ""));
+}
+
+void runPostWifiConnectTasks(const char* sourceTag) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  wifiReconnectFailures = 0;
+  wifiReconnectPending = false;
+  wifiNextReconnectAtMs = 0;
+  wifiLastConnectedAtMs = millis();
+  uiSetWifiMenuStatus(String("Connected: ") + WiFi.localIP().toString());
+
+  syncClockIfNeeded();
+
+  String todoErr;
+  if (fetchTodoEntityOptionsFromHomeAssistant(todoErr)) {
+    uiRefreshTodoEntityDropdown();
+  } else if (todoErr.length() > 0) {
+    Serial.println(String("[TODO] ") + sourceTag + " refresh: " + todoErr);
+  }
+
+  String syncErr;
+  if (!syncCloudData(true, syncErr) && syncErr.length() > 0) {
+    Serial.println(String("[SYNC] ") + sourceTag + " sync skipped: " + syncErr);
+  }
+}
+
 bool connectToWifi(const String& ssid, const String& password, uint32_t timeoutMs) {
   if (ssid.length() == 0) {
     return false;
   }
 
   WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+
+  if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == ssid) {
+    reconnectSsid = ssid;
+    reconnectPassword = password;
+    wifiReconnectFailures = 0;
+    wifiReconnectPending = false;
+    wifiNextReconnectAtMs = 0;
+    wifiLastConnectedAtMs = millis();
+    wifiLastStatus = WL_CONNECTED;
+    uiSetWifiMenuStatus(String("Connected: ") + WiFi.localIP().toString());
+    return true;
+  }
+
   WiFi.begin(ssid.c_str(), password.c_str());
 
   const unsigned long start = millis();
@@ -4645,12 +4737,86 @@ bool connectToWifi(const String& ssid, const String& password, uint32_t timeoutM
   }
 
   if (WiFi.status() == WL_CONNECTED) {
+    reconnectSsid = ssid;
+    reconnectPassword = password;
+    wifiReconnectFailures = 0;
+    wifiReconnectPending = false;
+    wifiNextReconnectAtMs = 0;
+    wifiLastConnectedAtMs = millis();
+    wifiLastStatus = WL_CONNECTED;
     uiSetWifiMenuStatus(String("Connected: ") + WiFi.localIP().toString());
     return true;
   }
 
+  wifiLastStatus = WiFi.status();
   uiSetWifiMenuStatus("Wi-Fi connect failed");
   return false;
+}
+
+void pollWifiResilience(uint32_t nowMs) {
+  if ((nowMs - wifiLastMonitorMs) < WIFI_MONITOR_POLL_MS) {
+    return;
+  }
+  wifiLastMonitorMs = nowMs;
+
+  const wl_status_t currentStatus = WiFi.status();
+  if (currentStatus != wifiLastStatus) {
+    Serial.println(String("[WIFI] status ") + String(static_cast<int>(wifiLastStatus)) + " -> "
+                   + String(static_cast<int>(currentStatus)));
+    wifiLastStatus = currentStatus;
+
+    if (currentStatus == WL_CONNECTED) {
+      if (state == AssistantState::ConnectingWiFi ||
+          (state == AssistantState::Idle && stateDetail.startsWith("Wi-Fi"))) {
+        setState(AssistantState::Idle, "Wi-Fi restored");
+      }
+      runPostWifiConnectTasks("reconnect");
+      return;
+    }
+
+    if (reconnectSsid.length() > 0) {
+      scheduleWifiReconnect(nowMs, true, "link lost");
+      if (state == AssistantState::Idle) {
+        setState(AssistantState::Idle, "Wi-Fi reconnecting");
+      }
+    } else {
+      uiSetWifiMenuStatus("Wi-Fi disconnected; set credentials");
+      if (state == AssistantState::Idle) {
+        setState(AssistantState::Idle, "Wi-Fi offline");
+      }
+    }
+  }
+
+  if (!wifiReconnectPending || reconnectSsid.length() == 0 || WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  const int32_t waitMs = static_cast<int32_t>(wifiNextReconnectAtMs - nowMs);
+  if (waitMs > 0) {
+    const uint32_t waitSec = static_cast<uint32_t>((waitMs + 999) / 1000);
+    uiSetWifiMenuStatus(String("Wi-Fi retry #") + String(wifiReconnectFailures + 1) + " in " + String(waitSec) + "s");
+    return;
+  }
+
+  if (state != AssistantState::Idle && state != AssistantState::ConnectingWiFi) {
+    wifiNextReconnectAtMs = nowMs + 1000;
+    return;
+  }
+
+  const uint8_t attemptNumber = static_cast<uint8_t>(wifiReconnectFailures + 1);
+  setState(AssistantState::ConnectingWiFi, String("Retry Wi-Fi #") + String(attemptNumber));
+
+  if (connectToWifi(reconnectSsid, reconnectPassword, WIFI_RECONNECT_ATTEMPT_TIMEOUT_MS)) {
+    setState(AssistantState::Idle, "Wi-Fi restored");
+    runPostWifiConnectTasks("retry");
+    return;
+  }
+
+  wifiReconnectFailures++;
+  scheduleWifiReconnect(nowMs, false, "retry failed");
+  if (state == AssistantState::ConnectingWiFi) {
+    setState(AssistantState::Idle, "Wi-Fi offline");
+  }
 }
 
 void uiUpdateStatus() {
@@ -4700,7 +4866,19 @@ void uiUpdateStatus() {
     }
   } else {
     if (uiLabelWifi) {
-      lv_label_set_text(uiLabelWifi, "Wi-Fi: disconnected");
+      String wifiLine = "Wi-Fi: disconnected";
+      if (wifiReconnectPending && reconnectSsid.length() > 0) {
+        const int32_t waitMs = static_cast<int32_t>(wifiNextReconnectAtMs - millis());
+        if (waitMs > 0) {
+          const uint32_t waitSec = static_cast<uint32_t>((waitMs + 999) / 1000);
+          wifiLine = String("Wi-Fi: retry #") + String(wifiReconnectFailures + 1) + " in " + String(waitSec) + "s";
+        } else {
+          wifiLine = String("Wi-Fi: reconnecting to ") + reconnectSsid;
+        }
+      } else if (reconnectSsid.length() > 0) {
+        wifiLine = String("Wi-Fi: offline (") + reconnectSsid + ")";
+      }
+      lv_label_set_text(uiLabelWifi, clipText(wifiLine, 52).c_str());
       lv_obj_set_style_text_color(uiLabelWifi, lv_color_hex(0xFCA5A5), LV_PART_MAIN);
     }
     if (uiIconWifi) {
@@ -6561,10 +6739,12 @@ void handleWifiConnect() {
 
   if (connectToWifi(ssid, password, 15000)) {
     setState(AssistantState::Idle, "Ready");
+    runPostWifiConnectTasks("manual");
     return;
   }
 
   setState(AssistantState::Idle, "Wi-Fi offline");
+  scheduleWifiReconnect(millis(), true, "manual connect failed");
 }
 
 void pollBootButton() {
@@ -6907,6 +7087,12 @@ void setup() {
   lv_indev_drv_register(&indevDrv);
 
   loadWifiConfig();
+  reconnectSsid = configuredSsid;
+  reconnectPassword = configuredPassword;
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  wifiLastStatus = WiFi.status();
   backlightPwmReady = ledcAttach(PIN_TFT_BL, BACKLIGHT_PWM_FREQ_HZ, BACKLIGHT_PWM_BITS);
   if (!backlightPwmReady) {
     Serial.println("[BL] pwm attach failed; using fixed backlight");
@@ -6982,25 +7168,13 @@ void setup() {
     setState(AssistantState::ConnectingWiFi, String("Connecting ") + configuredSsid);
     if (connectToWifi(configuredSsid, configuredPassword, 15000)) {
       setState(AssistantState::Idle, "Ready");
+      runPostWifiConnectTasks("boot");
     } else {
       setState(AssistantState::Idle, "Wi-Fi offline");
+      scheduleWifiReconnect(millis(), true, "boot connect failed");
     }
   } else {
     setState(AssistantState::Idle, "Set Wi-Fi in Settings > Wi-Fi");
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    syncClockIfNeeded();
-    String todoErr;
-    if (fetchTodoEntityOptionsFromHomeAssistant(todoErr)) {
-      uiRefreshTodoEntityDropdown();
-    } else {
-      Serial.println(String("[TODO] list refresh: ") + todoErr);
-    }
-    String syncErr;
-    if (!syncCloudData(true, syncErr)) {
-      Serial.println(String("[SYNC] initial sync skipped: ") + syncErr);
-    }
   }
 
   uiRefreshNow();
@@ -7024,6 +7198,7 @@ void loop() {
   pollHandsFreeTrigger();
   updatePocketPetLoop(now);
   maybeRunScheduledCloudSync(now);
+  pollWifiResilience(now);
 
   if (wifiScanRequested) {
     wifiScanRequested = false;

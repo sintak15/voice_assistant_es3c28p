@@ -71,6 +71,8 @@ static uint8_t wifiReconnectFailures = 0;
 static uint32_t wifiNextRetryAtMs = 0;
 static uint32_t wifiLastPollMs = 0;
 static wl_status_t wifiLastStatus = WL_IDLE_STATUS;
+static bool haAuthValidated = false;
+static uint32_t haAuthValidatedAtMs = 0;
 
 static String lastTranscript;
 static String lastReply;
@@ -90,6 +92,38 @@ String clipText(const String& text, size_t maxLen) {
     return text.substring(0, maxLen);
   }
   return text.substring(0, maxLen - 3) + "...";
+}
+
+String trimmedConfig(const char* value) {
+  String out(value ? value : "");
+  out.trim();
+  return out;
+}
+
+String normalizedAccessTokenValue() {
+  String token = trimmedConfig(HA_ACCESS_TOKEN);
+  if (token.length() >= 7) {
+    String prefix = token.substring(0, 7);
+    prefix.toLowerCase();
+    if (prefix == "bearer ") {
+      token.remove(0, 7);
+    }
+  }
+  token.trim();
+  return token;
+}
+
+String authHeaderValue() {
+  const String token = normalizedAccessTokenValue();
+  if (token.length() == 0) {
+    return "";
+  }
+  return String("Bearer ") + token;
+}
+
+void invalidateHaAuthProbeCache() {
+  haAuthValidated = false;
+  haAuthValidatedAtMs = 0;
 }
 
 const char* stateName(AssistantState s) {
@@ -191,7 +225,9 @@ void setReply(const String& text) {
 }
 
 bool isHomeAssistantConfigured() {
-  return strlen(HA_BASE_URL) > 0 && strlen(HA_ACCESS_TOKEN) > 0 && strlen(HA_STT_PROVIDER) > 0;
+  return trimmedConfig(HA_BASE_URL).length() > 0 &&
+         normalizedAccessTokenValue().length() > 0 &&
+         trimmedConfig(HA_STT_PROVIDER).length() > 0;
 }
 
 String joinedUrl(const char* base, const String& path) {
@@ -214,6 +250,16 @@ String baseLanguageTag(const String& language) {
     return language;
   }
   return language.substring(0, cut);
+}
+
+String ttsLanguageTag(const String& language) {
+  String out = language;
+  out.trim();
+  if (out.length() == 0) {
+    return out;
+  }
+  out.replace("-", "_");
+  return out;
 }
 
 bool beginHttp(HTTPClient& http, WiFiClientSecure& secureClient, const String& url) {
@@ -609,6 +655,79 @@ bool isRetryableSttTransportError(int code) {
          code == HTTPC_ERROR_CONNECTION_LOST ||
          code == HTTPC_ERROR_READ_TIMEOUT;
 }
+
+bool homeAssistantAuthProbe(String& outError) {
+  outError = "";
+
+  if (!isHomeAssistantConfigured()) {
+    outError = "HA not configured";
+    return false;
+  }
+
+  const String baseUrl = trimmedConfig(HA_BASE_URL);
+  const String authHeader = authHeaderValue();
+  if (baseUrl.length() == 0 || authHeader.length() == 0) {
+    outError = "HA config missing";
+    return false;
+  }
+
+  const String endpoint = joinedUrl(baseUrl.c_str(), "/api/");
+  HTTPClient http;
+  WiFiClientSecure secureClient;
+  if (!beginHttp(http, secureClient, endpoint)) {
+    outError = "Auth probe begin failed";
+    return false;
+  }
+
+  http.setReuse(false);
+  http.useHTTP10(true);
+  http.setConnectTimeout(STT_CONNECT_TIMEOUT_MS);
+  http.setTimeout(STT_IO_TIMEOUT_MS);
+  http.addHeader("Authorization", authHeader);
+
+  const int code = http.GET();
+  const String response = (code >= 200 && code <= 599) ? http.getString() : "";
+  http.end();
+
+  if (code >= 200 && code <= 299) {
+    return true;
+  }
+
+  outError = String("Auth probe HTTP ") + code;
+  if (code == 401 || code == 403) {
+    outError += ": token rejected";
+    invalidateHaAuthProbeCache();
+  }
+  if (response.length() > 0) {
+    outError += ": " + clipText(response, 72);
+  }
+  return false;
+}
+
+bool ensureHaAuthReady(String& outError) {
+  outError = "";
+
+  if (WiFi.status() != WL_CONNECTED) {
+    outError = "Wi-Fi disconnected";
+    invalidateHaAuthProbeCache();
+    return false;
+  }
+
+  const uint32_t nowMs = millis();
+  if (haAuthValidated && (nowMs - haAuthValidatedAtMs) < 300000UL) {
+    return true;
+  }
+
+  if (!homeAssistantAuthProbe(outError)) {
+    invalidateHaAuthProbeCache();
+    return false;
+  }
+
+  haAuthValidated = true;
+  haAuthValidatedAtMs = nowMs;
+  return true;
+}
+
 bool homeAssistantStt(const int16_t* samples, size_t sampleCount, String& outText, String& outError) {
   outText = "";
   outError = "";
@@ -618,8 +737,15 @@ bool homeAssistantStt(const int16_t* samples, size_t sampleCount, String& outTex
     return false;
   }
 
-  const String endpoint = joinedUrl(HA_BASE_URL, String("/api/stt/") + HA_STT_PROVIDER);
-  const String authHeader = String("Bearer ") + HA_ACCESS_TOKEN;
+  const String baseUrl = trimmedConfig(HA_BASE_URL);
+  const String sttProvider = trimmedConfig(HA_STT_PROVIDER);
+  const String authHeader = authHeaderValue();
+  if (baseUrl.length() == 0 || sttProvider.length() == 0 || authHeader.length() == 0) {
+    outError = "HA config missing";
+    return false;
+  }
+
+  const String endpoint = joinedUrl(baseUrl.c_str(), String("/api/stt/") + sttProvider);
 
   const auto tryLanguage = [&](const String& language, String& languageError) -> bool {
     const String speechHeader = String("language=") + language +
@@ -677,6 +803,9 @@ bool homeAssistantStt(const int16_t* samples, size_t sampleCount, String& outTex
       if (response.length() > 0) {
         languageError += ": " + clipText(response, 80);
       }
+      if (code == 401 || code == 403) {
+        invalidateHaAuthProbeCache();
+      }
 
       if (isRetryableSttTransportError(code) && retry < STT_MAX_RETRIES) {
         delay(200 + retry * 200);
@@ -719,7 +848,14 @@ bool homeAssistantConversation(const String& text, String& outReply, String& out
     return false;
   }
 
-  const String endpoint = joinedUrl(HA_BASE_URL, "/api/conversation/process");
+  const String baseUrl = trimmedConfig(HA_BASE_URL);
+  const String authHeader = authHeaderValue();
+  if (baseUrl.length() == 0 || authHeader.length() == 0) {
+    outError = "HA config missing";
+    return false;
+  }
+
+  const String endpoint = joinedUrl(baseUrl.c_str(), "/api/conversation/process");
   HTTPClient http;
   WiFiClientSecure secureClient;
   if (!beginHttp(http, secureClient, endpoint)) {
@@ -730,7 +866,7 @@ bool homeAssistantConversation(const String& text, String& outReply, String& out
   http.setReuse(false);
   http.setConnectTimeout(STT_CONNECT_TIMEOUT_MS);
   http.setTimeout(STT_IO_TIMEOUT_MS);
-  http.addHeader("Authorization", String("Bearer ") + HA_ACCESS_TOKEN);
+  http.addHeader("Authorization", authHeader);
   http.addHeader("Content-Type", "application/json");
 
   DynamicJsonDocument req(768);
@@ -749,6 +885,9 @@ bool homeAssistantConversation(const String& text, String& outReply, String& out
 
   if (code < 200 || code > 299) {
     outError = String("Conversation HTTP ") + code;
+    if (code == 401 || code == 403) {
+      invalidateHaAuthProbeCache();
+    }
     if (response.length() > 0) {
       outError += ": " + clipText(response, 80);
     }
@@ -782,11 +921,15 @@ bool normalizeUrl(String& url) {
   if (url.length() == 0) {
     return false;
   }
+  const String baseUrl = trimmedConfig(HA_BASE_URL);
+  if (baseUrl.length() == 0) {
+    return false;
+  }
   if (!url.startsWith("http://") && !url.startsWith("https://")) {
     if (!url.startsWith("/")) {
       url = "/" + url;
     }
-    url = joinedUrl(HA_BASE_URL, url);
+    url = joinedUrl(baseUrl.c_str(), url);
   }
   return true;
 }
@@ -799,67 +942,117 @@ bool homeAssistantTtsGetUrl(const String& text, String& outUrl, String& outError
     outError = "HA not configured";
     return false;
   }
-  if (strlen(HA_TTS_ENGINE_ID) == 0) {
+  const String baseUrl = trimmedConfig(HA_BASE_URL);
+  const String authHeader = authHeaderValue();
+  const String ttsEngine = trimmedConfig(HA_TTS_ENGINE_ID);
+  if (baseUrl.length() == 0 || authHeader.length() == 0) {
+    outError = "HA config missing";
+    return false;
+  }
+
+  if (ttsEngine.length() == 0) {
     outError = "TTS engine not configured";
     return false;
   }
 
-  const String endpoint = joinedUrl(HA_BASE_URL, "/api/tts_get_url");
-  HTTPClient http;
-  WiFiClientSecure secureClient;
-  if (!beginHttp(http, secureClient, endpoint)) {
-    outError = "TTS URL begin failed";
-    return false;
-  }
+  const String endpoint = joinedUrl(baseUrl.c_str(), "/api/tts_get_url");
+  const String configuredLang = trimmedConfig(HA_LANGUAGE);
+  const String preferredLang = ttsLanguageTag(configuredLang);
 
-  http.setReuse(false);
-  http.setConnectTimeout(STT_CONNECT_TIMEOUT_MS);
-  http.setTimeout(STT_IO_TIMEOUT_MS);
-  http.addHeader("Authorization", String("Bearer ") + HA_ACCESS_TOKEN);
-  http.addHeader("Content-Type", "application/json");
-
-  DynamicJsonDocument req(768);
-  req["engine_id"] = HA_TTS_ENGINE_ID;
-  req["message"] = text;
-  req["language"] = HA_LANGUAGE;
-  req["options"]["preferred_format"] = "wav";
-
-  String body;
-  serializeJson(req, body);
-
-  const int code = http.POST(body);
-  const String response = (code >= 200 && code <= 599) ? http.getString() : "";
-  http.end();
-
-  if (code < 200 || code > 299) {
-    outError = String("TTS URL HTTP ") + code;
-    if (response.length() > 0) {
-      outError += ": " + clipText(response, 80);
+  const auto fetchUrl = [&](const String& language, bool preferWav, String& attemptError) -> bool {
+    HTTPClient http;
+    WiFiClientSecure secureClient;
+    if (!beginHttp(http, secureClient, endpoint)) {
+      attemptError = "TTS URL begin failed";
+      return false;
     }
-    return false;
+
+    http.setReuse(false);
+    http.setConnectTimeout(STT_CONNECT_TIMEOUT_MS);
+    http.setTimeout(STT_IO_TIMEOUT_MS);
+    http.addHeader("Authorization", authHeader);
+    http.addHeader("Content-Type", "application/json");
+
+    DynamicJsonDocument req(768);
+    req["engine_id"] = ttsEngine;
+    req["message"] = text;
+    if (language.length() > 0) {
+      req["language"] = language;
+    }
+    if (preferWav) {
+      req["options"]["preferred_format"] = "wav";
+    }
+
+    String body;
+    serializeJson(req, body);
+
+    const int code = http.POST(body);
+    const String response = (code >= 200 && code <= 599) ? http.getString() : "";
+    http.end();
+
+    if (code < 200 || code > 299) {
+      attemptError = String("TTS URL HTTP ") + code;
+      if (code == 401 || code == 403) {
+        invalidateHaAuthProbeCache();
+      }
+      if (response.length() > 0) {
+        attemptError += ": " + clipText(response, 80);
+      }
+      return false;
+    }
+
+    DynamicJsonDocument doc(2048);
+    if (deserializeJson(doc, response)) {
+      attemptError = "TTS URL JSON parse failed";
+      return false;
+    }
+
+    outUrl = doc["url"] | "";
+    if (outUrl.length() == 0) {
+      outUrl = doc["path"] | "";
+    }
+    if (!normalizeUrl(outUrl)) {
+      attemptError = "TTS URL missing";
+      return false;
+    }
+
+    String loweredUrl = outUrl;
+    loweredUrl.toLowerCase();
+    if (loweredUrl.endsWith(".mp3")) {
+      attemptError = "TTS returned MP3 URL";
+      return false;
+    }
+
+    return true;
+  };
+
+  String attemptError;
+  if (fetchUrl(preferredLang, true, attemptError)) {
+    return true;
   }
 
-  DynamicJsonDocument doc(2048);
-  if (deserializeJson(doc, response)) {
-    outError = "TTS URL JSON parse failed";
-    return false;
+  if (configuredLang.length() > 0 && configuredLang != preferredLang) {
+    if (fetchUrl(configuredLang, true, attemptError)) {
+      return true;
+    }
   }
 
-  outUrl = doc["url"] | "";
-  if (outUrl.length() == 0) {
-    outUrl = doc["path"] | "";
+  if (fetchUrl("", true, attemptError)) {
+    return true;
   }
 
-  if (!normalizeUrl(outUrl)) {
-    outError = "TTS URL missing";
-    return false;
-  }
-
-  return true;
+  outError = attemptError;
+  return false;
 }
 
 bool homeAssistantPlayTtsWav(const String& ttsUrl, String& outError) {
   outError = "";
+  const String authHeader = authHeaderValue();
+  if (authHeader.length() == 0) {
+    outError = "HA token missing";
+    return false;
+  }
+
   String resolved = ttsUrl;
   if (!normalizeUrl(resolved)) {
     outError = "TTS URL invalid";
@@ -877,15 +1070,30 @@ bool homeAssistantPlayTtsWav(const String& ttsUrl, String& outError) {
   http.useHTTP10(true);
   http.setConnectTimeout(STT_CONNECT_TIMEOUT_MS);
   http.setTimeout(STT_IO_TIMEOUT_MS);
-  http.addHeader("Authorization", String("Bearer ") + HA_ACCESS_TOKEN);
+  http.addHeader("Authorization", authHeader);
+  const char* wantedHeaders[] = {"Content-Type"};
+  http.collectHeaders(wantedHeaders, 1);
 
   const int code = http.GET();
   if (code < 200 || code > 299) {
     outError = String("TTS WAV HTTP ") + code;
+    if (code == 401 || code == 403) {
+      invalidateHaAuthProbeCache();
+    }
     const String body = (code >= 200 && code <= 599) ? http.getString() : "";
     if (body.length() > 0) {
       outError += ": " + clipText(body, 80);
     }
+    http.end();
+    return false;
+  }
+
+  const String contentType = http.header("Content-Type");
+  if (contentType.length() > 0 &&
+      contentType.indexOf("audio/wav") < 0 &&
+      contentType.indexOf("audio/x-wav") < 0 &&
+      contentType.indexOf("audio/wave") < 0) {
+    outError = "TTS content-type not WAV: " + clipText(contentType, 34);
     http.end();
     return false;
   }
@@ -993,6 +1201,7 @@ void pollWifiConnection(uint32_t nowMs) {
       wifiReconnectPending = false;
       wifiReconnectFailures = 0;
       wifiNextRetryAtMs = 0;
+      invalidateHaAuthProbeCache();
       if (state == AssistantState::ConnectingWiFi) {
         setState(AssistantState::Idle, "Wi-Fi connected");
       }
@@ -1074,6 +1283,12 @@ void runAssistantCycle() {
     return;
   }
 
+  String authErr;
+  if (!ensureHaAuthReady(authErr)) {
+    setState(AssistantState::Error, "HA auth failed: " + clipText(authErr, 45));
+    return;
+  }
+
   setState(AssistantState::Listening, "Capturing audio");
   drawScreen(true);
 
@@ -1138,6 +1353,11 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("[FW] HA Voice Core clean restart");
+  Serial.println(
+      String("[CFG] base_len=") + trimmedConfig(HA_BASE_URL).length() +
+      " token_len=" + normalizedAccessTokenValue().length() +
+      " stt_len=" + trimmedConfig(HA_STT_PROVIDER).length() +
+      " tts_len=" + trimmedConfig(HA_TTS_ENGINE_ID).length());
 
   pinMode(PIN_BOOT_BUTTON, INPUT_PULLUP);
   pinMode(PIN_TFT_BL, OUTPUT);

@@ -403,6 +403,46 @@ class I2SMicCapture {
     return setClock(sampleRate_, I2S_SLOT_MODE_STEREO);
   }
 
+  bool flushIoBuffers() {
+    if (!ready_) {
+      return false;
+    }
+
+    int16_t scratch[128 * 2] = {0};
+    i2s_.setTimeout(6);
+    for (uint8_t i = 0; i < 4; ++i) {
+      const size_t bytesRead = i2s_.readBytes(reinterpret_cast<char*>(scratch), sizeof(scratch));
+      if (bytesRead == 0) {
+        break;
+      }
+    }
+    i2s_.setTimeout(100);
+    return true;
+  }
+
+  bool restartDriver() {
+    if (!ready_) {
+      return false;
+    }
+
+    i2s_.end();
+    delay(8);
+    i2s_.setPins(PIN_AUDIO_BCLK, PIN_AUDIO_LRCLK, PIN_AUDIO_DOUT, PIN_AUDIO_DIN, PIN_AUDIO_MCLK);
+    i2s_.setTimeout(100);
+    if (!i2s_.begin(I2S_MODE_STD, sampleRate_, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH)) {
+      ready_ = false;
+      activeSampleRate_ = 0;
+      activeSlotMode_ = I2S_SLOT_MODE_MONO;
+      return false;
+    }
+
+    activeSampleRate_ = sampleRate_;
+    activeSlotMode_ = I2S_SLOT_MODE_STEREO;
+    setAudioEnable(false);
+    flushIoBuffers();
+    return true;
+  }
+
   esp_err_t readForSr(void* out, size_t len, size_t* bytesRead, uint32_t timeoutMs) {
     if (bytesRead) {
       *bytesRead = 0;

@@ -12,6 +12,7 @@
 #include <Wire.h>
 #include <esp_heap_caps.h>
 #include <cstring>
+#include <math.h>
 #include <stdlib.h>
 
 #include "board_pins.h"
@@ -148,17 +149,10 @@ enum : int {
 static const sr_cmd_t kLocalWakeCommands[] = {
     {SR_CMD_WAKE_BOB, "ok mister bob", "bKd MgSTk BnB"},
     {SR_CMD_WAKE_BOB, "okay mister bob", "bKd MgSTk BnB"},
-    {SR_CMD_CANCEL, "cancel", "KaNScL"},
-    {SR_CMD_CANCEL, "never mind", "NfVk MiND"},
-    {SR_CMD_CANCEL, "nevermind", "NfVkMiND"},
-    {SR_CMD_CANCEL, "stop", "STnP"},
-    {SR_CMD_CANCEL, "cancel that", "KaNScL jaT"},
-    {SR_CMD_REPEAT, "repeat", "RgPmT"},
-    {SR_CMD_REPEAT, "say again", "Sd cGfN"},
-    {SR_CMD_REPEAT, "repeat that", "RgPmT jaT"},
-    {SR_CMD_STATUS, "status", "STaTcS"},
-    {SR_CMD_STATUS, "what is your status", "WcT gZ YeR STaTcS"},
+    {SR_CMD_WAKE_BOB, "ok mr bob", "bKd MgSTk BnB"},
+    {SR_CMD_WAKE_BOB, "okay mr bob", "bKd MgSTk BnB"},
 };
+static const sr_mode_t LOCAL_WAKE_SR_MODE = SR_MODE_COMMAND;
 #endif
 
 enum class CaptureRequestSource : uint8_t {
@@ -170,7 +164,7 @@ enum class CaptureRequestSource : uint8_t {
 
 static TFT_eSPI tft = TFT_eSPI(SCREEN_WIDTH, SCREEN_HEIGHT);
 static lv_disp_draw_buf_t lvDrawBuf;
-static lv_color_t lvDrawPixels[SCREEN_WIDTH * 20];
+static lv_color_t* lvDrawPixels = nullptr;
 static Ft6336Touch touch;
 static bool touchReady = false;
 static bool uiReady = false;
@@ -190,6 +184,7 @@ static lv_obj_t* uiBtnControlRecover = nullptr;
 static lv_obj_t* uiLabelDiagnosticsRun = nullptr;
 static lv_obj_t* uiLabelDiagnosticsStageA = nullptr;
 static lv_obj_t* uiLabelDiagnosticsStageB = nullptr;
+static lv_obj_t* uiLabelDiagnosticsMic = nullptr;
 static lv_obj_t* uiLabelDiagnosticsRuntime = nullptr;
 static lv_obj_t* uiTaTranscript = nullptr;
 static lv_obj_t* uiTaReply = nullptr;
@@ -211,7 +206,7 @@ static bool localWakeEnabled = false;
 static bool localWakeReady = false;
 static bool localWakePaused = false;
 static volatile bool localWakeStartInProgress = false;
-static TaskHandle_t localWakeStartTaskHandle = nullptr;
+static volatile bool localWakeStopRequested = false;
 static volatile bool localWakeTriggerPending = false;
 static volatile uint32_t localWakeTriggerAtMs = 0;
 static volatile int localWakeCommandId = -1;
@@ -222,6 +217,12 @@ static uint32_t handsFreeVadLastPollMs = 0;
 static uint32_t handsFreeArmAtMs = 0;
 static float handsFreeNoiseRms = 0.0f;
 static CaptureMetrics handsFreeLastLevel;
+static uint32_t handsFreeLastLevelMs = 0;
+static volatile float localWakeLiveRms = 0.0f;
+static volatile float localWakeLivePeak = 0.0f;
+static volatile uint32_t localWakeLiveUpdatedMs = 0;
+static volatile uint32_t localWakeFillOkCount = 0;
+static volatile uint32_t localWakeFillFailCount = 0;
 
 static bool bootPressed = false;
 static uint32_t bootLastTriggerMs = 0;
@@ -262,6 +263,7 @@ static uint8_t lowHeapConsecutive = 0;
 static float listeningFrameRms = 0.0f;
 static float listeningFramePeak = 0.0f;
 static uint32_t listeningCapturedMs = 0;
+static uint32_t lastWakeStatsLogMs = 0;
 static bool listeningSpeechStarted = false;
 static uint32_t listeningUiLastRefreshMs = 0;
 static uint32_t successfulCycleCount = 0;
@@ -376,6 +378,27 @@ String formatMsCompact(uint32_t ms) {
     return String(ms / 1000) + "s";
   }
   return String(ms / 1000.0f, 1) + "s";
+}
+
+void updateLiveMicStatsFromPcm16(const int16_t* samples, size_t sampleCount) {
+  if (!samples || sampleCount == 0) {
+    return;
+  }
+
+  uint32_t peak = 0;
+  double sumSq = 0.0;
+  for (size_t i = 0; i < sampleCount; ++i) {
+    const int32_t v = static_cast<int32_t>(samples[i]);
+    const uint32_t absV = static_cast<uint32_t>(v < 0 ? -v : v);
+    if (absV > peak) {
+      peak = absV;
+    }
+    sumSq += static_cast<double>(v) * static_cast<double>(v);
+  }
+
+  localWakeLiveRms = static_cast<float>(sqrt(sumSq / static_cast<double>(sampleCount)) / 32768.0);
+  localWakeLivePeak = static_cast<float>(peak) / 32768.0f;
+  localWakeLiveUpdatedMs = millis();
 }
 
 void uiUpdateStatus(uint32_t nowMs);
@@ -863,10 +886,16 @@ void buildUi() {
   lv_obj_set_width(uiLabelDiagnosticsStageB, SCREEN_WIDTH - 30);
   lv_obj_align(uiLabelDiagnosticsStageB, LV_ALIGN_TOP_LEFT, 0, 48);
 
+  uiLabelDiagnosticsMic = lv_label_create(diagPanel);
+  lv_label_set_text(uiLabelDiagnosticsMic, "Mic: pending");
+  lv_obj_set_width(uiLabelDiagnosticsMic, SCREEN_WIDTH - 30);
+  lv_obj_align(uiLabelDiagnosticsMic, LV_ALIGN_TOP_LEFT, 0, 78);
+  lv_obj_set_style_text_color(uiLabelDiagnosticsMic, lv_color_hex(0xA5F3FC), LV_PART_MAIN);
+
   uiLabelDiagnosticsRuntime = lv_label_create(diagPanel);
   lv_label_set_text(uiLabelDiagnosticsRuntime, "Heap: pending");
   lv_obj_set_width(uiLabelDiagnosticsRuntime, SCREEN_WIDTH - 30);
-  lv_obj_align(uiLabelDiagnosticsRuntime, LV_ALIGN_TOP_LEFT, 0, 78);
+  lv_obj_align(uiLabelDiagnosticsRuntime, LV_ALIGN_TOP_LEFT, 0, 106);
   lv_label_set_long_mode(uiLabelDiagnosticsRuntime, LV_LABEL_LONG_WRAP);
   lv_obj_set_style_text_color(uiLabelDiagnosticsRuntime, lv_color_hex(0x9FB3CF), LV_PART_MAIN);
 
@@ -1041,6 +1070,56 @@ void uiUpdateStatus(uint32_t nowMs) {
         "  OK " + successfulCycleCount +
         "  ER " + errorStateCount;
     lv_label_set_text(uiLabelDiagnosticsStageB, clipText(stageB, 62).c_str());
+  }
+  if (uiLabelDiagnosticsMic) {
+    float micRms = 0.0f;
+    float micPeak = 0.0f;
+    uint32_t micAgeMs = 0;
+    const char* micSource = "none";
+    const uint32_t srFillOk = localWakeFillOkCount;
+    const uint32_t srFillFail = localWakeFillFailCount;
+
+    if (state == AssistantState::Listening) {
+      micSource = "listen";
+      micRms = listeningFrameRms;
+      micPeak = listeningFramePeak;
+      micAgeMs = 0;
+    } else {
+      const uint32_t wakeUpdatedMs = localWakeLiveUpdatedMs;
+      if (wakeUpdatedMs > 0) {
+        micSource = "wake";
+        micRms = localWakeLiveRms;
+        micPeak = localWakeLivePeak;
+        micAgeMs = nowMs - wakeUpdatedMs;
+      } else if (handsFreeLastLevelMs > 0) {
+        micSource = "vad";
+        micRms = handsFreeLastLevel.rmsNorm;
+        micPeak = handsFreeLastLevel.peakNorm;
+        micAgeMs = nowMs - handsFreeLastLevelMs;
+      } else if (lastCaptureMs > 0) {
+        micSource = "last";
+        micRms = lastCaptureRms;
+        micPeak = lastCapturePeak;
+        micAgeMs = nowMs - lastCaptureMs;
+      }
+    }
+
+    String micLine = "Mic live: pending";
+    if (strcmp(micSource, "none") != 0) {
+      micLine =
+          String("Mic ") + micSource +
+          "  rms " + String(micRms, 4) +
+          "  pk " + String(micPeak, 4) +
+          "  age " + formatMsCompact(micAgeMs) +
+          "  sr " + srFillOk + "/" + srFillFail;
+    } else if (localWakeEnabled) {
+      micLine = String("Mic wake waiting  sr ") + srFillOk + "/" + srFillFail;
+    }
+    lv_label_set_text(uiLabelDiagnosticsMic, clipText(micLine, 74).c_str());
+    lv_obj_set_style_text_color(
+        uiLabelDiagnosticsMic,
+        strcmp(micSource, "none") == 0 ? lv_color_hex(0x94A3B8) : lv_color_hex(0xA5F3FC),
+        LV_PART_MAIN);
   }
   if (uiLabelDiagnosticsRuntime) {
     String runtimeLine =
@@ -2978,14 +3057,16 @@ esp_err_t localWakeFillCb(void* arg, void* out, size_t len, size_t* bytesRead, u
   if (!out || len == 0 || !bytesRead) {
     return ESP_ERR_INVALID_ARG;
   }
-  if (!handsFreeEnabled || !localWakeReady || localWakePaused) {
+  const bool wakeEngineLive = localWakeReady || localWakeStartInProgress;
+  if (!handsFreeEnabled || !wakeEngineLive || localWakePaused) {
     vTaskDelay(pdMS_TO_TICKS(20));
     return ESP_FAIL;
   }
-  // Allow SR startup while we're still in Booting; otherwise sr_start can
-  // stall waiting for audio because this callback rejects non-idle states.
+  // During startup, allow Booting/Connecting so sr_start can consume frames
+  // and finish initialization before we mark localWakeReady.
   const bool wakeAcceptingState =
       state == AssistantState::Booting ||
+      state == AssistantState::ConnectingWiFi ||
       state == AssistantState::Idle ||
       state == AssistantState::Error;
   if (!audioReady || !wakeAcceptingState || captureRequested) {
@@ -2994,26 +3075,49 @@ esp_err_t localWakeFillCb(void* arg, void* out, size_t len, size_t* bytesRead, u
   }
 
   const uint32_t effectiveTimeout = timeoutMs == 0 || timeoutMs == UINT32_MAX ? 80 : timeoutMs;
-  return micCapture.readForSr(out, len, bytesRead, effectiveTimeout);
+  const esp_err_t fillErr = micCapture.readForSr(out, len, bytesRead, effectiveTimeout);
+  if (fillErr == ESP_OK && *bytesRead >= sizeof(int16_t)) {
+    localWakeFillOkCount++;
+    updateLiveMicStatsFromPcm16(
+        static_cast<const int16_t*>(out),
+        *bytesRead / sizeof(int16_t));
+  } else {
+    localWakeFillFailCount++;
+  }
+  return fillErr;
 }
 
 void localWakeEventCb(void* arg, sr_event_t event, int commandId, int phraseId) {
   (void)arg;
   if (event == SR_EVENT_TIMEOUT) {
+    Serial.println("[WAKE] event timeout");
     if (localWakeReady && !localWakePaused) {
-      sr_set_mode(SR_MODE_COMMAND);
+      sr_set_mode(LOCAL_WAKE_SR_MODE);
     }
+    return;
+  }
+  if (event == SR_EVENT_WAKEWORD || event == SR_EVENT_WAKEWORD_CHANNEL) {
+    Serial.println(
+        String("[WAKE] event wakeword cmd=") + commandId +
+        " phrase=" + phraseId);
+    localWakeCommandId = SR_CMD_WAKE_BOB;
+    localWakePhraseId = phraseId;
+    localWakeTriggerAtMs = millis();
+    localWakeTriggerPending = true;
     return;
   }
   if (event != SR_EVENT_COMMAND) {
     return;
   }
+  Serial.println(
+      String("[WAKE] event command cmd=") + commandId +
+      " phrase=" + phraseId);
   localWakeCommandId = commandId;
   localWakePhraseId = phraseId;
   localWakeTriggerAtMs = millis();
   localWakeTriggerPending = true;
   if (localWakeReady && !localWakePaused) {
-    sr_set_mode(SR_MODE_COMMAND);
+    sr_set_mode(LOCAL_WAKE_SR_MODE);
   }
 }
 
@@ -3045,31 +3149,66 @@ bool startLocalWakeEngine(String& outError) {
     return false;
   }
 
+  localWakePaused = false;
+  localWakeStopRequested = false;
+  localWakeReady = true;
+  // Mark wake ready before sr_start so the fill callback can supply frames if
+  // sr_start blocks during internal initialization.
+  Serial.println("[WAKE] local wake detector ready");
+  Serial.println("[WAKE] sr_start begin");
   const esp_err_t err = sr_start(
       localWakeFillCb,
       nullptr,
       SR_CHANNELS_STEREO,
-      SR_MODE_COMMAND,
+      LOCAL_WAKE_SR_MODE,
       "MM",
       kLocalWakeCommands,
       sizeof(kLocalWakeCommands) / sizeof(kLocalWakeCommands[0]),
       localWakeEventCb,
       nullptr);
-  if (err != ESP_OK) {
-    outError = String("sr_start failed: ") + err;
+  const bool stopRequested = localWakeStopRequested;
+  localWakeStopRequested = false;
+
+  if (stopRequested) {
     localWakeReady = false;
-    return false;
+    localWakePaused = false;
+    localWakeTriggerPending = false;
+    localWakeCommandId = -1;
+    localWakePhraseId = -1;
+    return true;
   }
 
-  localWakePaused = false;
-  localWakeReady = true;
-  Serial.println("[WAKE] local wake detector ready");
+  if (err != ESP_OK) {
+    localWakeReady = false;
+    localWakePaused = false;
+    localWakeTriggerPending = false;
+    localWakeCommandId = -1;
+    localWakePhraseId = -1;
+    outError = String("sr_start failed err: ") + err;
+    return false;
+  }
+  // If sr_start returned without an explicit stop request, verify SR is still
+  // active. Non-blocking implementations should pass this; unexpected exits fail.
+  const esp_err_t pauseErr = sr_pause();
+  if (pauseErr != ESP_OK) {
+    localWakeReady = false;
+    localWakePaused = false;
+    localWakeTriggerPending = false;
+    localWakeCommandId = -1;
+    localWakePhraseId = -1;
+    outError = "sr exited unexpectedly";
+    return false;
+  }
+  sr_resume();
+  sr_set_mode(LOCAL_WAKE_SR_MODE);
+  Serial.println("[WAKE] sr_start active");
   return true;
 #endif
 }
 
 void stopLocalWakeEngine() {
 #if ASSISTANT_HAS_LOCAL_SR
+  localWakeStopRequested = true;
   if (localWakeReady) {
     sr_stop();
   }
@@ -3108,25 +3247,9 @@ void resumeLocalWakeEngine() {
     localWakeTriggerPending = false;
     localWakeCommandId = -1;
     localWakePhraseId = -1;
-    sr_set_mode(SR_MODE_COMMAND);
+    sr_set_mode(LOCAL_WAKE_SR_MODE);
   }
 #endif
-}
-
-void localWakeStartTask(void* arg) {
-  (void)arg;
-  String wakeErr;
-  const bool started = startLocalWakeEngine(wakeErr);
-  if (!started) {
-    localWakeEnabled = false;
-    localWakeReady = false;
-    Serial.println(
-        String("[WAKE] local disabled: ") +
-        (wakeErr.length() ? wakeErr : "start failed"));
-  }
-  localWakeStartInProgress = false;
-  localWakeStartTaskHandle = nullptr;
-  vTaskDelete(nullptr);
 }
 
 void queueLocalWakeStart(const char* reason) {
@@ -3135,22 +3258,19 @@ void queueLocalWakeStart(const char* reason) {
     return;
   }
   localWakeStartInProgress = true;
-  BaseType_t created = xTaskCreate(
-      localWakeStartTask,
-      "wake-start",
-      8192,
-      nullptr,
-      1,
-      &localWakeStartTaskHandle);
-  if (created != pdPASS) {
-    localWakeStartTaskHandle = nullptr;
-    localWakeStartInProgress = false;
+  Serial.println(String("[WAKE] local start begin: ") + reason);
+  String wakeErr;
+  const bool started = startLocalWakeEngine(wakeErr);
+  localWakeStartInProgress = false;
+  if (!started) {
     localWakeEnabled = false;
     localWakeReady = false;
-    Serial.println("[WAKE] local disabled: start task create failed");
+    Serial.println(
+        String("[WAKE] local disabled: ") +
+        (wakeErr.length() ? wakeErr : "start failed"));
     return;
   }
-  Serial.println(String("[WAKE] local start queued: ") + reason);
+  Serial.println(String("[WAKE] local start ready: ") + reason);
 #else
   (void)reason;
 #endif
@@ -3294,6 +3414,7 @@ void pollHandsFreeTrigger(uint32_t nowMs) {
     return;
   }
   handsFreeLastLevel = level;
+  handsFreeLastLevelMs = nowMs;
 
   if (handsFreeNoiseRms <= 0.0f) {
     handsFreeNoiseRms = level.rmsNorm;
@@ -3708,6 +3829,24 @@ void setup() {
   tft.setRotation(0);
   tft.fillScreen(TFT_BLACK);
   lv_init();
+  const size_t lvDrawPixelCount = SCREEN_WIDTH * 20;
+  const size_t lvDrawBytes = lvDrawPixelCount * sizeof(lv_color_t);
+  lvDrawPixels = static_cast<lv_color_t*>(
+      heap_caps_malloc(lvDrawBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!lvDrawPixels) {
+    lvDrawPixels = static_cast<lv_color_t*>(
+        heap_caps_malloc(lvDrawBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
+  if (!lvDrawPixels) {
+    Serial.println("[UI] LVGL draw buffer allocation failed");
+    setState(AssistantState::Error, "UI draw buffer alloc failed");
+    while (true) {
+      delay(1000);
+    }
+  }
+  Serial.println(
+      String("[UI] lvbuf bytes=") + lvDrawBytes +
+      " psram=" + (psramFound() ? "yes" : "no"));
   lv_disp_draw_buf_init(&lvDrawBuf, lvDrawPixels, nullptr, SCREEN_WIDTH * 20);
 
   static lv_disp_drv_t dispDrv;
@@ -3781,11 +3920,9 @@ void setup() {
   Serial.println(String("[WAKE] hands-free ") + (handsFreeEnabled ? "enabled" : "disabled"));
   Serial.println(String("[WAKE] local detector ") + (localWakeEnabled ? "enabled" : "disabled"));
 #if ASSISTANT_HAS_LOCAL_SR
-  Serial.println("[WAKE] phrases: ok mister bob | okay mister bob");
+  Serial.println("[WAKE] phrases: ok mister bob");
+  Serial.println("[WAKE] mode: command");
 #endif
-  if (localWakeEnabled) {
-    queueLocalWakeStart("boot");
-  }
 
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
@@ -3809,6 +3946,11 @@ void setup() {
     setState(AssistantState::Error, "Set HA_BASE_URL/HA_ACCESS_TOKEN/HA_STT_PROVIDER");
   }
 
+  if (localWakeEnabled) {
+    // Start local SR after Wi-Fi boot work to reduce internal-RAM contention.
+    queueLocalWakeStart("post-boot");
+  }
+
   drawScreen(true);
 }
 
@@ -3820,6 +3962,16 @@ void loop() {
   pollHandsFreeTrigger(nowMs);
   pollWifiConnection(nowMs);
   pollRuntimeHealth(nowMs);
+  if (localWakeEnabled && (nowMs - lastWakeStatsLogMs) >= 3000) {
+    lastWakeStatsLogMs = nowMs;
+    Serial.println(
+        String("[WAKE] stats ready=") + (localWakeReady ? "1" : "0") +
+        " paused=" + (localWakePaused ? "1" : "0") +
+        " ok=" + localWakeFillOkCount +
+        " fail=" + localWakeFillFailCount +
+        " rms=" + String(localWakeLiveRms, 4) +
+        " pk=" + String(localWakeLivePeak, 4));
+  }
 
   if (uiActionCapture) {
     uiActionCapture = false;

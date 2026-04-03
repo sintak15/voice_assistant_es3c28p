@@ -1,6 +1,7 @@
 param(
   [string]$Port = "COM10",
-  [string]$BuildPath = ".\\build"
+  [string]$BuildPath = ".\\build",
+  [string]$ModelPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,12 +31,24 @@ if (-not $arduinoCli) {
 
 & $arduinoCli compile --fqbn $fqbn --build-path $BuildPath .
 
-$modelSrc = "$env:LOCALAPPDATA\\Arduino15\\packages\\esp32\\tools\\esp32s3-libs\\3.3.7\\esp_sr\\srmodels.bin"
+$workspaceRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$customModel = Join-Path $workspaceRoot "custom_models_wn9l\\srmodels.bin"
+$defaultModel = "$env:LOCALAPPDATA\\Arduino15\\packages\\esp32\\tools\\esp32s3-libs\\3.3.7\\esp_sr\\srmodels.bin"
+
+if (-not [string]::IsNullOrWhiteSpace($ModelPath)) {
+  $modelSrc = $ModelPath
+} elseif (Test-Path $customModel) {
+  $modelSrc = $customModel
+} else {
+  $modelSrc = $defaultModel
+}
+
 $modelDst = Join-Path $BuildPath "srmodels.bin"
 if (-not (Test-Path $modelSrc)) {
   throw "ESP-SR model missing at $modelSrc"
 }
 Copy-Item -Force $modelSrc $modelDst
+Write-Host "Using SR model: $modelSrc"
 
 & $arduinoCli upload --fqbn $fqbn --port $Port --input-dir $BuildPath .
 

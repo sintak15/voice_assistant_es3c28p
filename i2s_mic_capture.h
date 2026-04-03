@@ -453,8 +453,27 @@ class I2SMicCapture {
     const uint32_t boundedTimeout = (timeoutMs == 0 || timeoutMs == UINT32_MAX) ? 100 : timeoutMs;
     i2s_.setTimeout(boundedTimeout);
     const size_t got = i2s_.readBytes(reinterpret_cast<char*>(out), len);
-    *bytesRead = got;
-    return got > 0 ? ESP_OK : ESP_FAIL;
+    if (got == 0) {
+      return ESP_FAIL;
+    }
+
+    // SR currently consumes stereo input. Collapse each stereo frame to the
+    // dominant channel so channel polarity/wiring differences do not suppress
+    // recognizer confidence.
+    int16_t* samples = reinterpret_cast<int16_t*>(out);
+    const size_t stereoFrames = got / (sizeof(int16_t) * 2);
+    for (size_t i = 0; i < stereoFrames; ++i) {
+      const int16_t left = samples[i * 2];
+      const int16_t right = samples[i * 2 + 1];
+      const int32_t absLeft = left < 0 ? -static_cast<int32_t>(left) : static_cast<int32_t>(left);
+      const int32_t absRight = right < 0 ? -static_cast<int32_t>(right) : static_cast<int32_t>(right);
+      const int16_t mono = absLeft >= absRight ? left : right;
+      samples[i * 2] = mono;
+      samples[i * 2 + 1] = mono;
+    }
+
+    *bytesRead = stereoFrames * sizeof(int16_t) * 2;
+    return *bytesRead > 0 ? ESP_OK : ESP_FAIL;
   }
 
   static CaptureMetrics analyze(const int16_t* samples, size_t count) {

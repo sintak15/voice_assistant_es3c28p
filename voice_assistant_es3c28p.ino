@@ -6,6 +6,7 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <TFT_eSPI.h>
+#include <lvgl.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Wire.h>
@@ -15,6 +16,7 @@
 
 #include "board_pins.h"
 #include "es8311_codec.h"
+#include "ft6336_touch.h"
 #include "i2s_mic_capture.h"
 #include "secrets.example.h"
 #if __has_include("secrets.h")
@@ -94,7 +96,7 @@ static const uint16_t SCREEN_HEIGHT = 320;
 #endif
 
 #ifndef ASSISTANT_LOW_HEAP_THRESHOLD_BYTES
-#define ASSISTANT_LOW_HEAP_THRESHOLD_BYTES 12000
+#define ASSISTANT_LOW_HEAP_THRESHOLD_BYTES 7000
 #endif
 
 #ifndef ASSISTANT_STT_UPLOAD_MAX_SECONDS
@@ -128,15 +130,34 @@ static const uint32_t HANDSFREE_VAD_POLL_INTERVAL_MS = 120;
 static const uint32_t HANDSFREE_VAD_COOLDOWN_MS = 2600;
 static const uint32_t RUNTIME_HEALTH_POLL_MS = 1000;
 static const uint32_t WATCHDOG_STRIKE_WINDOW_MS = 8UL * 60UL * 1000UL;
+static const uint16_t UI_TAB_INDEX_LAUNCHER = 0;
+static const uint16_t UI_TAB_INDEX_ASSISTANT = 1;
+static const uint16_t UI_TAB_INDEX_CONTROLS = 2;
+static const uint16_t UI_TAB_INDEX_DIAGNOSTICS = 3;
+static const uint16_t UI_TAB_INDEX_LOGS = 4;
+static const uint16_t UI_TAB_COUNT = 5;
 
 #if ASSISTANT_HAS_LOCAL_SR
 #include <esp32-hal-sr.h>
 enum : int {
   SR_CMD_WAKE_BOB = 1,
+  SR_CMD_CANCEL = 2,
+  SR_CMD_REPEAT = 3,
+  SR_CMD_STATUS = 4,
 };
 static const sr_cmd_t kLocalWakeCommands[] = {
     {SR_CMD_WAKE_BOB, "ok mister bob", "bKd MgSTk BnB"},
     {SR_CMD_WAKE_BOB, "okay mister bob", "bKd MgSTk BnB"},
+    {SR_CMD_CANCEL, "cancel", "KaNScL"},
+    {SR_CMD_CANCEL, "never mind", "NfVk MiND"},
+    {SR_CMD_CANCEL, "nevermind", "NfVkMiND"},
+    {SR_CMD_CANCEL, "stop", "STnP"},
+    {SR_CMD_CANCEL, "cancel that", "KaNScL jaT"},
+    {SR_CMD_REPEAT, "repeat", "RgPmT"},
+    {SR_CMD_REPEAT, "say again", "Sd cGfN"},
+    {SR_CMD_REPEAT, "repeat that", "RgPmT jaT"},
+    {SR_CMD_STATUS, "status", "STaTcS"},
+    {SR_CMD_STATUS, "what is your status", "WcT gZ YeR STaTcS"},
 };
 #endif
 
@@ -148,8 +169,30 @@ enum class CaptureRequestSource : uint8_t {
 };
 
 static TFT_eSPI tft = TFT_eSPI(SCREEN_WIDTH, SCREEN_HEIGHT);
-static TFT_eSprite uiSprite = TFT_eSprite(&tft);
-static bool uiSpriteReady = false;
+static lv_disp_draw_buf_t lvDrawBuf;
+static lv_color_t lvDrawPixels[SCREEN_WIDTH * 20];
+static Ft6336Touch touch;
+static bool touchReady = false;
+static bool uiReady = false;
+static lv_obj_t* uiTabview = nullptr;
+static lv_obj_t* uiLabelLauncherState = nullptr;
+static lv_obj_t* uiLabelLauncherWifi = nullptr;
+static lv_obj_t* uiLabelAssistantState = nullptr;
+static lv_obj_t* uiLabelAssistantDetail = nullptr;
+static lv_obj_t* uiLabelAssistantWifi = nullptr;
+static lv_obj_t* uiLabelAssistantMic = nullptr;
+static lv_obj_t* uiLabelAssistantHint = nullptr;
+static lv_obj_t* uiLabelControlsStatus = nullptr;
+static lv_obj_t* uiLabelDiagnosticsRun = nullptr;
+static lv_obj_t* uiLabelDiagnosticsStageA = nullptr;
+static lv_obj_t* uiLabelDiagnosticsStageB = nullptr;
+static lv_obj_t* uiLabelDiagnosticsRuntime = nullptr;
+static lv_obj_t* uiTaTranscript = nullptr;
+static lv_obj_t* uiTaReply = nullptr;
+static bool uiActionCapture = false;
+static bool uiActionRepeat = false;
+static bool uiActionWifiRetry = false;
+static bool uiActionRecoverAudio = false;
 static Es8311Codec codec;
 static I2SMicCapture micCapture;
 
@@ -165,6 +208,7 @@ static bool localWakeReady = false;
 static bool localWakePaused = false;
 static volatile bool localWakeTriggerPending = false;
 static volatile uint32_t localWakeTriggerAtMs = 0;
+static volatile int localWakeCommandId = -1;
 static volatile int localWakePhraseId = -1;
 static uint8_t handsFreeVadActiveFrames = 0;
 static uint32_t handsFreeCooldownUntilMs = 0;
@@ -214,6 +258,15 @@ static float listeningFramePeak = 0.0f;
 static uint32_t listeningCapturedMs = 0;
 static bool listeningSpeechStarted = false;
 static uint32_t listeningUiLastRefreshMs = 0;
+static uint32_t successfulCycleCount = 0;
+static uint32_t errorStateCount = 0;
+static uint32_t lastCycleTotalMs = 0;
+static uint32_t lastCycleListeningMs = 0;
+static uint32_t lastCycleSttMs = 0;
+static uint32_t lastCycleThinkingMs = 0;
+static uint32_t lastCycleTtsUrlMs = 0;
+static uint32_t lastCyclePlaybackMs = 0;
+static String lastCycleResult = "(none)";
 
 String clipText(const String& text, size_t maxLen) {
   if (text.length() <= maxLen) {
@@ -319,6 +372,9 @@ void renderUiFrame(DisplayT& display, uint32_t nowMs) {
 
   display.setTextColor(TFT_WHITE, TFT_BLACK);
   display.drawString(String("State: ") + stateName(state), 8, 34, 2);
+  const uint32_t stateAgeSec = (nowMs - stateEnteredAtMs) / 1000;
+  display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  display.drawString(String("Age ") + stateAgeSec + "s", 160, 34, 2);
 
   if (state == AssistantState::Error) {
     static const size_t kErrorCharsPerLine = 58;
@@ -329,7 +385,7 @@ void renderUiFrame(DisplayT& display, uint32_t nowMs) {
     }
   } else {
     display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    display.drawString(clipText(stateDetail, 46), 8, 52, 2);
+    display.drawString(clipText(stateDetail, 38), 8, 52, 2);
   }
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -403,16 +459,30 @@ void renderUiFrame(DisplayT& display, uint32_t nowMs) {
     display.setTextColor(TFT_WHITE, panelBg);
     display.drawString(String("Live: ") + String(listeningCapturedMs / 1000.0f, 1) + "s", 14, 289, 2);
   } else {
+    display.setTextColor(TFT_YELLOW, TFT_BLACK);
+    display.drawString("Last Run", 8, 214, 2);
+
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    const String runSummary =
+        String("Result ") + clipText(lastCycleResult, 16) +
+        " " + formatMsCompact(lastCycleTotalMs);
+    display.drawString(clipText(runSummary, 42), 8, 232, 2);
+
+    const String stageLineA =
+        String("L ") + formatMsCompact(lastCycleListeningMs) +
+        " STT " + formatMsCompact(lastCycleSttMs) +
+        " AI " + formatMsCompact(lastCycleThinkingMs);
+    display.drawString(clipText(stageLineA, 44), 8, 250, 2);
+
+    const String stageLineB =
+        String("TU ") + formatMsCompact(lastCycleTtsUrlMs) +
+        " TP " + formatMsCompact(lastCyclePlaybackMs) +
+        " OK " + successfulCycleCount +
+        " ER " + errorStateCount;
+    display.drawString(clipText(stageLineB, 44), 8, 268, 2);
+
     display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
     display.drawString("Press BOOT for capture", 8, 288, 2);
-
-    if (lastCaptureSamples > 0) {
-      display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-      const String capInfo =
-          String("Last cap ") + String(lastCaptureMs / 1000.0f, 2) +
-          "s pk " + String(lastCapturePeak * 100.0f, 1) + "%";
-      display.drawString(clipText(capInfo, 42), 8, 270, 2);
-    }
   }
 }
 
@@ -2349,7 +2419,9 @@ esp_err_t localWakeFillCb(void* arg, void* out, size_t len, size_t* bytesRead, u
     vTaskDelay(pdMS_TO_TICKS(20));
     return ESP_FAIL;
   }
-  if (!audioReady || state != AssistantState::Idle || captureRequested) {
+  const bool wakeAcceptingState =
+      state == AssistantState::Idle || state == AssistantState::Error;
+  if (!audioReady || !wakeAcceptingState || captureRequested) {
     vTaskDelay(pdMS_TO_TICKS(12));
     return ESP_FAIL;
   }
@@ -2360,18 +2432,39 @@ esp_err_t localWakeFillCb(void* arg, void* out, size_t len, size_t* bytesRead, u
 
 void localWakeEventCb(void* arg, sr_event_t event, int commandId, int phraseId) {
   (void)arg;
-  if (event != SR_EVENT_COMMAND || commandId != SR_CMD_WAKE_BOB) {
+  if (event == SR_EVENT_TIMEOUT) {
+    if (localWakeReady && !localWakePaused) {
+      sr_set_mode(SR_MODE_COMMAND);
+    }
     return;
   }
+  if (event != SR_EVENT_COMMAND) {
+    return;
+  }
+  localWakeCommandId = commandId;
   localWakePhraseId = phraseId;
   localWakeTriggerAtMs = millis();
   localWakeTriggerPending = true;
+  if (localWakeReady && !localWakePaused) {
+    sr_set_mode(SR_MODE_COMMAND);
+  }
+}
+
+String formatMsCompact(uint32_t ms) {
+  if (ms == 0) {
+    return "-";
+  }
+  if (ms >= 10000) {
+    return String(ms / 1000) + "s";
+  }
+  return String(ms / 1000.0f, 1) + "s";
 }
 #endif
 
 bool startLocalWakeEngine(String& outError) {
   outError = "";
   localWakeTriggerPending = false;
+  localWakeCommandId = -1;
   localWakePhraseId = -1;
 
   if (!localWakeEnabled || !handsFreeEnabled) {
@@ -2426,6 +2519,7 @@ void stopLocalWakeEngine() {
   localWakeReady = false;
   localWakePaused = false;
   localWakeTriggerPending = false;
+  localWakeCommandId = -1;
   localWakePhraseId = -1;
 }
 
@@ -2454,26 +2548,119 @@ void resumeLocalWakeEngine() {
   if (sr_resume() == ESP_OK) {
     localWakePaused = false;
     localWakeTriggerPending = false;
+    localWakeCommandId = -1;
+    localWakePhraseId = -1;
+    sr_set_mode(SR_MODE_COMMAND);
   }
 #endif
+}
+
+void handleLocalRepeatCommand() {
+  if (lastReply.length() == 0) {
+    setState(AssistantState::Idle, "Repeat: no last reply");
+    return;
+  }
+  if (strlen(HA_TTS_ENGINE_ID) == 0) {
+    setState(AssistantState::Idle, "Repeat: TTS disabled");
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    setState(AssistantState::Idle, "Repeat: Wi-Fi offline");
+    scheduleWifiReconnect(millis(), true, "local repeat while offline");
+    return;
+  }
+
+  String authErr;
+  if (!ensureHaAuthReady(authErr)) {
+    setState(AssistantState::Idle, "Repeat auth failed");
+    return;
+  }
+
+  struct LocalWakePauseGuard {
+    bool paused = false;
+    LocalWakePauseGuard() { paused = pauseLocalWakeEngine(); }
+    ~LocalWakePauseGuard() {
+      if (paused) {
+        resumeLocalWakeEngine();
+      }
+    }
+  } localWakePauseGuard;
+
+  setState(AssistantState::Speaking, "Repeating last reply");
+  drawScreen(true);
+
+  String ttsUrl;
+  String ttsErr;
+  if (!homeAssistantTtsGetUrl(lastReply, ttsUrl, ttsErr)) {
+    setState(AssistantState::Idle, "Repeat TTS URL failed");
+    return;
+  }
+  if (!homeAssistantPlayTtsWav(ttsUrl, ttsErr)) {
+    setState(AssistantState::Idle, "Repeat playback failed");
+    return;
+  }
+
+  setState(AssistantState::Idle, "Ready");
+}
+
+void handleLocalStatusCommand() {
+  String detail = "Wi-Fi ";
+  if (WiFi.status() == WL_CONNECTED) {
+    detail += "up ";
+    detail += String(WiFi.RSSI());
+    detail += "dBm";
+  } else {
+    detail += "down";
+  }
+  detail += " HF ";
+  detail += (handsFreeEnabled ? "on" : "off");
+  setState(AssistantState::Idle, clipText(detail, 48));
 }
 
 void pollLocalWakeTrigger(uint32_t nowMs) {
   if (!handsFreeEnabled || !localWakeEnabled || !localWakeReady) {
     return;
   }
-  if (!localWakeTriggerPending || captureRequested || state != AssistantState::Idle) {
+  const bool wakeAcceptingState =
+      state == AssistantState::Idle || state == AssistantState::Error;
+  if (!localWakeTriggerPending || captureRequested || !wakeAcceptingState) {
     return;
   }
+  const int commandId = localWakeCommandId;
+  const int phraseId = localWakePhraseId;
+  localWakeTriggerPending = false;
+  localWakeCommandId = -1;
+  localWakePhraseId = -1;
+
   if (nowMs < handsFreeCooldownUntilMs) {
     return;
   }
-
-  localWakeTriggerPending = false;
   handsFreeCooldownUntilMs = nowMs + LOCAL_WAKE_COOLDOWN_MS;
   handsFreeVadActiveFrames = 0;
-  Serial.println(String("[WAKE] local trigger phrase=") + localWakePhraseId);
-  requestCapture(CaptureRequestSource::Wake, "WAKE");
+
+  Serial.println(
+      String("[WAKE] local cmd=") + commandId +
+      " phrase=" + phraseId);
+
+  switch (commandId) {
+    case SR_CMD_WAKE_BOB:
+      requestCapture(CaptureRequestSource::Wake, "WAKE");
+      return;
+    case SR_CMD_CANCEL:
+      captureRequested = false;
+      captureSource = CaptureRequestSource::Unknown;
+      setState(AssistantState::Idle, "Canceled");
+      return;
+    case SR_CMD_REPEAT:
+      handleLocalRepeatCommand();
+      return;
+    case SR_CMD_STATUS:
+      handleLocalStatusCommand();
+      return;
+    default:
+      setState(AssistantState::Idle, "Unknown local command");
+      return;
+  }
 }
 
 void pollHandsFreeTrigger(uint32_t nowMs) {
@@ -2640,7 +2827,10 @@ void pollRuntimeHealth(uint32_t nowMs) {
   }
 
   const size_t internalFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-  if (internalFree < ASSISTANT_LOW_HEAP_THRESHOLD_BYTES) {
+  const bool lowHeap = internalFree < ASSISTANT_LOW_HEAP_THRESHOLD_BYTES;
+  // Local SR keeps baseline internal heap lower while idle; only trigger
+  // recovery from low-heap conditions when actively in a busy stage.
+  if (lowHeap && stateBusy()) {
     if (lowHeapConsecutive < 10) {
       lowHeapConsecutive++;
     }

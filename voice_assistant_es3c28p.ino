@@ -109,6 +109,8 @@ static const float CAPTURE_MIN_PEAK = 0.030f;
 static const uint16_t STT_CONNECT_TIMEOUT_MS = 7000;
 static const uint16_t STT_IO_TIMEOUT_MS = 14000;
 static const uint8_t STT_MAX_RETRIES = 1;
+static const uint16_t TTS_STREAM_READ_TIMEOUT_MS = 120;
+static const uint16_t TTS_STREAM_IDLE_EOF_MS = 700;
 
 static const uint32_t WIFI_POLL_INTERVAL_MS = 700;
 static const uint32_t WIFI_RETRY_BASE_MS = 2000;
@@ -1059,9 +1061,19 @@ bool streamWavPcmToSpeaker(Stream& stream, uint32_t dataBytes, uint16_t channels
 
     size_t readBytes = 0;
     if (unknownDataLen) {
-      readBytes = stream.readBytes(reinterpret_cast<char*>(inSamples), toRead);
+      const int availableNow = stream.available();
+      if (availableNow <= 0) {
+        if ((millis() - lastProgressMs) > TTS_STREAM_IDLE_EOF_MS) {
+          break;
+        }
+        delay(2);
+        continue;
+      }
+      const size_t readable = static_cast<size_t>(availableNow);
+      const size_t readTarget = readable < toRead ? readable : toRead;
+      readBytes = stream.readBytes(reinterpret_cast<char*>(inSamples), readTarget);
       if (readBytes == 0) {
-        if ((millis() - lastProgressMs) > 1500) {
+        if ((millis() - lastProgressMs) > TTS_STREAM_IDLE_EOF_MS) {
           break;
         }
         delay(2);
@@ -1858,7 +1870,12 @@ bool homeAssistantPlayTtsWav(const String& ttsUrl, String& outError) {
     return false;
   }
 
+  wavStream->setTimeout(TTS_STREAM_READ_TIMEOUT_MS);
+  const uint32_t playStartMs = millis();
   const bool ok = playWavFromStream(*wavStream, outError);
+  Serial.println(
+      String("[TTS] wav_play_ms=") + (millis() - playStartMs) +
+      " ok=" + (ok ? "1" : "0"));
   http.end();
   return ok;
 }

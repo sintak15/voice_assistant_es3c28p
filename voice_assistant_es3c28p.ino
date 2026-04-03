@@ -183,6 +183,10 @@ static lv_obj_t* uiLabelAssistantWifi = nullptr;
 static lv_obj_t* uiLabelAssistantMic = nullptr;
 static lv_obj_t* uiLabelAssistantHint = nullptr;
 static lv_obj_t* uiLabelControlsStatus = nullptr;
+static lv_obj_t* uiBtnControlCapture = nullptr;
+static lv_obj_t* uiBtnControlRepeat = nullptr;
+static lv_obj_t* uiBtnControlWifi = nullptr;
+static lv_obj_t* uiBtnControlRecover = nullptr;
 static lv_obj_t* uiLabelDiagnosticsRun = nullptr;
 static lv_obj_t* uiLabelDiagnosticsStageA = nullptr;
 static lv_obj_t* uiLabelDiagnosticsStageB = nullptr;
@@ -206,6 +210,8 @@ static bool handsFreeEnabled = false;
 static bool localWakeEnabled = false;
 static bool localWakeReady = false;
 static bool localWakePaused = false;
+static volatile bool localWakeStartInProgress = false;
+static TaskHandle_t localWakeStartTaskHandle = nullptr;
 static volatile bool localWakeTriggerPending = false;
 static volatile uint32_t localWakeTriggerAtMs = 0;
 static volatile int localWakeCommandId = -1;
@@ -218,7 +224,7 @@ static float handsFreeNoiseRms = 0.0f;
 static CaptureMetrics handsFreeLastLevel;
 
 static bool bootPressed = false;
-static uint32_t bootPressStartMs = 0;
+static uint32_t bootLastTriggerMs = 0;
 
 static String configuredSsid;
 static String configuredPassword;
@@ -362,145 +368,701 @@ const char* stateName(AssistantState s) {
   return "Unknown";
 }
 
-template <typename DisplayT>
-void renderUiFrame(DisplayT& display, uint32_t nowMs) {
-  display.fillScreen(TFT_BLACK);
-  display.setTextDatum(TL_DATUM);
-
-  display.setTextColor(TFT_CYAN, TFT_BLACK);
-  display.drawString("HA Voice Core", 8, 8, 2);
-
-  display.setTextColor(TFT_WHITE, TFT_BLACK);
-  display.drawString(String("State: ") + stateName(state), 8, 34, 2);
-  const uint32_t stateAgeSec = (nowMs - stateEnteredAtMs) / 1000;
-  display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  display.drawString(String("Age ") + stateAgeSec + "s", 160, 34, 2);
-
-  if (state == AssistantState::Error) {
-    static const size_t kErrorCharsPerLine = 58;
-    display.setTextColor(TFT_RED, TFT_BLACK);
-    display.drawString(clipText(stateDetail, kErrorCharsPerLine), 8, 52, 1);
-    if (stateDetail.length() > kErrorCharsPerLine) {
-      display.drawString(tailText(stateDetail, kErrorCharsPerLine), 8, 62, 1);
-    }
-  } else {
-    display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    display.drawString(clipText(stateDetail, 38), 8, 52, 2);
+String formatMsCompact(uint32_t ms) {
+  if (ms == 0) {
+    return "-";
   }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    display.setTextColor(TFT_GREEN, TFT_BLACK);
-    display.drawString(clipText(String("Wi-Fi: ") + WiFi.SSID() + " " + String(WiFi.RSSI()) + " dBm", 50), 8, 74, 2);
-  } else {
-    display.setTextColor(TFT_ORANGE, TFT_BLACK);
-    if (wifiReconnectPending) {
-      int32_t waitMs = static_cast<int32_t>(wifiNextRetryAtMs - nowMs);
-      if (waitMs < 0) {
-        waitMs = 0;
-      }
-      display.drawString(String("Wi-Fi retry in ") + String((waitMs + 999) / 1000) + "s", 8, 74, 2);
-    } else {
-      display.drawString("Wi-Fi disconnected", 8, 74, 2);
-    }
+  if (ms >= 10000) {
+    return String(ms / 1000) + "s";
   }
-
-  display.setTextColor(TFT_YELLOW, TFT_BLACK);
-  display.drawString("Transcript", 8, 108, 2);
-  display.setTextColor(TFT_WHITE, TFT_BLACK);
-  display.drawString(clipText(lastTranscript.length() ? lastTranscript : "(none)", 62), 8, 126, 2);
-
-  display.setTextColor(TFT_YELLOW, TFT_BLACK);
-  display.drawString("Reply", 8, 168, 2);
-  display.setTextColor(TFT_WHITE, TFT_BLACK);
-  display.drawString(clipText(lastReply.length() ? lastReply : "(none)", 62), 8, 186, 2);
-
-  if (state == AssistantState::Listening) {
-    const uint16_t panelBg = display.color565(34, 6, 6);
-    const uint16_t panelBorder = display.color565(230, 70, 70);
-    const uint16_t meterBg = display.color565(60, 60, 60);
-    const uint16_t pulseColor = ((nowMs / 180) % 2) == 0 ? TFT_ORANGE : TFT_RED;
-
-    display.fillRoundRect(8, 220, 224, 90, 10, panelBg);
-    display.drawRoundRect(8, 220, 224, 90, 10, panelBorder);
-    display.fillCircle(24, 238, 7, pulseColor);
-
-    display.setTextColor(TFT_WHITE, panelBg);
-    display.drawString("LISTENING", 38, 228, 4);
-    display.setTextColor(TFT_LIGHTGREY, panelBg);
-    display.drawString(listeningSpeechStarted ? "Speech detected" : "Waiting for speech", 14, 254, 2);
-
-    const int meterX = 14;
-    const int meterY = 274;
-    const int meterW = 196;
-    const int meterH = 10;
-    display.fillRect(meterX, meterY, meterW, meterH, meterBg);
-    display.drawRect(meterX, meterY, meterW, meterH, TFT_DARKGREY);
-
-    int rmsWidth = static_cast<int>(listeningFrameRms * 3800.0f);
-    if (rmsWidth < 0) {
-      rmsWidth = 0;
-    }
-    if (rmsWidth > (meterW - 2)) {
-      rmsWidth = meterW - 2;
-    }
-    if (rmsWidth > 0) {
-      display.fillRect(meterX + 1, meterY + 1, rmsWidth, meterH - 2, TFT_CYAN);
-    }
-
-    int peakX = meterX + static_cast<int>(listeningFramePeak * (meterW - 2));
-    if (peakX < meterX + 1) {
-      peakX = meterX + 1;
-    }
-    if (peakX > meterX + meterW - 2) {
-      peakX = meterX + meterW - 2;
-    }
-    display.drawFastVLine(peakX, meterY - 1, meterH + 2, TFT_YELLOW);
-
-    display.setTextColor(TFT_WHITE, panelBg);
-    display.drawString(String("Live: ") + String(listeningCapturedMs / 1000.0f, 1) + "s", 14, 289, 2);
-  } else {
-    display.setTextColor(TFT_YELLOW, TFT_BLACK);
-    display.drawString("Last Run", 8, 214, 2);
-
-    display.setTextColor(TFT_WHITE, TFT_BLACK);
-    const String runSummary =
-        String("Result ") + clipText(lastCycleResult, 16) +
-        " " + formatMsCompact(lastCycleTotalMs);
-    display.drawString(clipText(runSummary, 42), 8, 232, 2);
-
-    const String stageLineA =
-        String("L ") + formatMsCompact(lastCycleListeningMs) +
-        " STT " + formatMsCompact(lastCycleSttMs) +
-        " AI " + formatMsCompact(lastCycleThinkingMs);
-    display.drawString(clipText(stageLineA, 44), 8, 250, 2);
-
-    const String stageLineB =
-        String("TU ") + formatMsCompact(lastCycleTtsUrlMs) +
-        " TP " + formatMsCompact(lastCyclePlaybackMs) +
-        " OK " + successfulCycleCount +
-        " ER " + errorStateCount;
-    display.drawString(clipText(stageLineB, 44), 8, 268, 2);
-
-    display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    display.drawString("Press BOOT for capture", 8, 288, 2);
-  }
+  return String(ms / 1000.0f, 1) + "s";
 }
+
+void uiUpdateStatus(uint32_t nowMs);
 
 void drawScreen(bool force) {
   const uint32_t nowMs = millis();
-  const uint32_t minRefreshMs = state == AssistantState::Listening ? 90 : 350;
-  if (!force && !uiDirty && (nowMs - lastUiDrawMs) < minRefreshMs) {
+  const uint32_t minRefreshMs = state == AssistantState::Listening ? 85 : 260;
+
+  if (uiReady) {
+    if (force || uiDirty || (nowMs - lastUiDrawMs) >= minRefreshMs) {
+      uiUpdateStatus(nowMs);
+      uiDirty = false;
+      lastUiDrawMs = nowMs;
+    }
+    lv_timer_handler();
     return;
   }
 
+  if (!force && !uiDirty && (nowMs - lastUiDrawMs) < 450) {
+    return;
+  }
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
+  tft.drawString("UI offline", 8, 8, 2);
+  tft.drawString(String("State: ") + stateName(state), 8, 30, 2);
+  tft.drawString(clipText(stateDetail, 40), 8, 52, 2);
   uiDirty = false;
   lastUiDrawMs = nowMs;
+}
 
-  if (uiSpriteReady) {
-    renderUiFrame(uiSprite, nowMs);
-    uiSprite.pushSprite(0, 0);
+lv_color_t uiStateColor(AssistantState s) {
+  switch (s) {
+    case AssistantState::Booting:
+      return lv_color_hex(0x93C5FD);
+    case AssistantState::ConnectingWiFi:
+      return lv_color_hex(0x60A5FA);
+    case AssistantState::Idle:
+      return lv_color_hex(0x34D399);
+    case AssistantState::Listening:
+      return lv_color_hex(0xF59E0B);
+    case AssistantState::Transcribing:
+      return lv_color_hex(0xFBBF24);
+    case AssistantState::Thinking:
+      return lv_color_hex(0xC4B5FD);
+    case AssistantState::Speaking:
+      return lv_color_hex(0x2DD4BF);
+    case AssistantState::Error:
+      return lv_color_hex(0xF87171);
+  }
+  return lv_color_hex(0xE5E7EB);
+}
+
+const char* uiStateHint(AssistantState s) {
+  switch (s) {
+    case AssistantState::Booting:
+      return "Bringing up display, audio, and network";
+    case AssistantState::ConnectingWiFi:
+      return "Joining Wi-Fi and validating cloud";
+    case AssistantState::Idle:
+      return "Tap Capture, or press BOOT to talk";
+    case AssistantState::Listening:
+      return "Listening with VAD and live levels";
+    case AssistantState::Transcribing:
+      return "Uploading audio to STT";
+    case AssistantState::Thinking:
+      return "Waiting for conversation response";
+    case AssistantState::Speaking:
+      return "Streaming TTS playback";
+    case AssistantState::Error:
+      return "Use Recover Audio, then retry";
+  }
+  return "";
+}
+
+TouchPoint mapTouchToRotation0(const TouchPoint& raw) {
+  int mappedX = raw.x;
+  int mappedY = raw.y;
+  if (mappedX < 0) {
+    mappedX = 0;
+  }
+  if (mappedX >= SCREEN_WIDTH) {
+    mappedX = SCREEN_WIDTH - 1;
+  }
+  if (mappedY < 0) {
+    mappedY = 0;
+  }
+  if (mappedY >= SCREEN_HEIGHT) {
+    mappedY = SCREEN_HEIGHT - 1;
+  }
+  return {
+      static_cast<uint16_t>(mappedX),
+      static_cast<uint16_t>(mappedY),
+  };
+}
+
+void lvglFlushCb(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p) {
+  const uint16_t w = static_cast<uint16_t>(area->x2 - area->x1 + 1);
+  const uint16_t h = static_cast<uint16_t>(area->y2 - area->y1 + 1);
+
+  tft.startWrite();
+  tft.setAddrWindow(area->x1, area->y1, w, h);
+  tft.pushColors(reinterpret_cast<uint16_t*>(&color_p->full), static_cast<uint32_t>(w) * h, true);
+  tft.endWrite();
+
+  lv_disp_flush_ready(disp);
+}
+
+void lvglTouchReadCb(lv_indev_drv_t* drv, lv_indev_data_t* data) {
+  (void)drv;
+  if (!touchReady) {
+    data->state = LV_INDEV_STATE_REL;
+    return;
+  }
+
+  TouchPoint raw{};
+  if (!touch.readPoint(raw)) {
+    data->state = LV_INDEV_STATE_REL;
+    return;
+  }
+
+  const TouchPoint mapped = mapTouchToRotation0(raw);
+  data->state = LV_INDEV_STATE_PR;
+  data->point.x = mapped.x;
+  data->point.y = mapped.y;
+}
+
+void uiSetControlsStatus(const String& text) {
+  if (uiLabelControlsStatus) {
+    lv_label_set_text(uiLabelControlsStatus, clipText(text, 70).c_str());
+  }
+  uiDirty = true;
+}
+
+void uiOpenLauncherTabEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) == LV_EVENT_CLICKED && uiTabview) {
+    lv_tabview_set_act(uiTabview, UI_TAB_INDEX_LAUNCHER, LV_ANIM_ON);
+  }
+}
+
+void uiOpenAssistantTabEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) == LV_EVENT_CLICKED && uiTabview) {
+    lv_tabview_set_act(uiTabview, UI_TAB_INDEX_ASSISTANT, LV_ANIM_ON);
+  }
+}
+
+void uiOpenControlsTabEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) == LV_EVENT_CLICKED && uiTabview) {
+    lv_tabview_set_act(uiTabview, UI_TAB_INDEX_CONTROLS, LV_ANIM_ON);
+  }
+}
+
+void uiOpenDiagnosticsTabEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) == LV_EVENT_CLICKED && uiTabview) {
+    lv_tabview_set_act(uiTabview, UI_TAB_INDEX_DIAGNOSTICS, LV_ANIM_ON);
+  }
+}
+
+void uiOpenLogsTabEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) == LV_EVENT_CLICKED && uiTabview) {
+    lv_tabview_set_act(uiTabview, UI_TAB_INDEX_LOGS, LV_ANIM_ON);
+  }
+}
+
+void uiCaptureButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  uiActionCapture = true;
+  uiSetControlsStatus("Capture requested");
+}
+
+void uiRepeatButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  uiActionRepeat = true;
+  uiSetControlsStatus("Repeat requested");
+}
+
+void uiWifiRetryButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  uiActionWifiRetry = true;
+  uiSetControlsStatus("Wi-Fi reconnect requested");
+}
+
+void uiRecoverAudioButtonEventCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+  uiActionRecoverAudio = true;
+  uiSetControlsStatus("Audio recovery requested");
+}
+
+void uiStylePanel(lv_obj_t* panel, uint32_t bgColor, uint32_t borderColor) {
+  lv_obj_set_style_bg_color(panel, lv_color_hex(bgColor), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(panel, 1, LV_PART_MAIN);
+  lv_obj_set_style_border_color(panel, lv_color_hex(borderColor), LV_PART_MAIN);
+  lv_obj_set_style_radius(panel, 10, LV_PART_MAIN);
+}
+
+void uiStyleLauncherButton(lv_obj_t* button, uint32_t borderColor, uint32_t bgColor) {
+  lv_obj_set_style_radius(button, 10, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(button, lv_color_hex(bgColor), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(button, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(button, 1, LV_PART_MAIN);
+  lv_obj_set_style_border_color(button, lv_color_hex(borderColor), LV_PART_MAIN);
+  lv_obj_set_style_shadow_width(button, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(button, 5, LV_PART_MAIN);
+}
+
+void uiBuildSubmenuHeader(lv_obj_t* tab, const char* title) {
+  lv_obj_t* nav = lv_obj_create(tab);
+  lv_obj_set_size(nav, SCREEN_WIDTH, 34);
+  lv_obj_align(nav, LV_ALIGN_TOP_MID, 0, 0);
+  lv_obj_set_style_bg_color(nav, lv_color_hex(0x0F172A), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(nav, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(nav, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(nav, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(nav, 0, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(nav, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_clear_flag(nav, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t* backBtn = lv_btn_create(nav);
+  lv_obj_set_size(backBtn, 56, 24);
+  lv_obj_align(backBtn, LV_ALIGN_LEFT_MID, 4, 0);
+  lv_obj_set_style_radius(backBtn, 6, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(backBtn, lv_color_hex(0x1E293B), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(backBtn, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_event_cb(backBtn, uiOpenLauncherTabEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* backLabel = lv_label_create(backBtn);
+  lv_label_set_text(backLabel, "Back");
+  lv_obj_center(backLabel);
+
+  lv_obj_t* titleLabel = lv_label_create(nav);
+  lv_label_set_text(titleLabel, title);
+  lv_obj_set_style_text_color(titleLabel, lv_color_hex(0xCBD5E1), LV_PART_MAIN);
+  lv_obj_align(titleLabel, LV_ALIGN_CENTER, 0, 0);
+}
+
+void buildUi() {
+  lv_obj_t* scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, lv_color_hex(0x05070B), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_text_color(scr, lv_color_hex(0xE5E7EB), LV_PART_MAIN);
+
+  uiTabview = lv_tabview_create(scr, LV_DIR_TOP, 0);
+  lv_obj_set_size(uiTabview, SCREEN_WIDTH, SCREEN_HEIGHT);
+  lv_obj_set_style_bg_color(uiTabview, lv_color_hex(0x05070B), LV_PART_MAIN);
+  lv_obj_set_style_border_width(uiTabview, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(uiTabview, 0, LV_PART_MAIN);
+
+  lv_obj_t* tabBtns = lv_tabview_get_tab_btns(uiTabview);
+  if (tabBtns) {
+    lv_obj_add_flag(tabBtns, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_size(tabBtns, 1, 1);
+  }
+  lv_obj_t* tabContent = lv_tabview_get_content(uiTabview);
+  if (tabContent) {
+    // Keep tab switching button-driven only; disable user swipe between tabs.
+    lv_obj_clear_flag(tabContent, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(tabContent, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
+    lv_obj_clear_flag(tabContent, LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_clear_flag(tabContent, LV_OBJ_FLAG_SCROLL_MOMENTUM);
+    lv_obj_set_scroll_dir(tabContent, LV_DIR_NONE);
+    lv_obj_set_scrollbar_mode(tabContent, LV_SCROLLBAR_MODE_OFF);
+  }
+
+  lv_obj_t* tabLauncher = lv_tabview_add_tab(uiTabview, "Launcher");
+  lv_obj_t* tabAssistant = lv_tabview_add_tab(uiTabview, "Assistant");
+  lv_obj_t* tabControls = lv_tabview_add_tab(uiTabview, "Controls");
+  lv_obj_t* tabDiagnostics = lv_tabview_add_tab(uiTabview, "Diagnostics");
+  lv_obj_t* tabLogs = lv_tabview_add_tab(uiTabview, "Logs");
+  lv_obj_t* tabs[UI_TAB_COUNT] = {
+      tabLauncher,
+      tabAssistant,
+      tabControls,
+      tabDiagnostics,
+      tabLogs,
+  };
+  for (uint16_t i = 0; i < UI_TAB_COUNT; ++i) {
+    lv_obj_set_scrollbar_mode(tabs[i], LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_pad_all(tabs[i], 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(tabs[i], lv_color_hex(0x05070B), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(tabs[i], LV_OPA_COVER, LV_PART_MAIN);
+  }
+
+  lv_obj_t* launchHeader = lv_obj_create(tabLauncher);
+  lv_obj_set_size(launchHeader, SCREEN_WIDTH - 12, 58);
+  lv_obj_align(launchHeader, LV_ALIGN_TOP_MID, 0, 6);
+  uiStylePanel(launchHeader, 0x0B1220, 0x253147);
+  lv_obj_set_style_pad_all(launchHeader, 7, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(launchHeader, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_clear_flag(launchHeader, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t* launchTitle = lv_label_create(launchHeader);
+  lv_label_set_text(launchTitle, "Voice Launcher");
+  lv_obj_set_style_text_color(launchTitle, lv_color_hex(0x7DD3FC), LV_PART_MAIN);
+  lv_obj_align(launchTitle, LV_ALIGN_TOP_LEFT, 0, 0);
+
+  uiLabelLauncherState = lv_label_create(launchHeader);
+  lv_label_set_text(uiLabelLauncherState, "State: Booting");
+  lv_obj_set_width(uiLabelLauncherState, SCREEN_WIDTH - 30);
+  lv_obj_align(uiLabelLauncherState, LV_ALIGN_TOP_LEFT, 0, 18);
+
+  uiLabelLauncherWifi = lv_label_create(launchHeader);
+  lv_label_set_text(uiLabelLauncherWifi, "Wi-Fi: offline");
+  lv_obj_set_width(uiLabelLauncherWifi, SCREEN_WIDTH - 30);
+  lv_obj_align(uiLabelLauncherWifi, LV_ALIGN_TOP_LEFT, 0, 34);
+
+  lv_obj_t* launchGrid = lv_obj_create(tabLauncher);
+  lv_obj_set_size(launchGrid, SCREEN_WIDTH - 12, 246);
+  lv_obj_align(launchGrid, LV_ALIGN_TOP_MID, 0, 68);
+  uiStylePanel(launchGrid, 0x090E19, 0x202C3F);
+  const int16_t launchGridPad = 10;
+  const int16_t launchGap = 10;
+  lv_obj_set_style_pad_all(launchGrid, launchGridPad, LV_PART_MAIN);
+  lv_obj_set_style_pad_row(launchGrid, launchGap, LV_PART_MAIN);
+  lv_obj_set_style_pad_column(launchGrid, launchGap, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(launchGrid, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_clear_flag(launchGrid, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_clip_corner(launchGrid, true, LV_PART_MAIN);
+  lv_obj_set_layout(launchGrid, LV_LAYOUT_FLEX);
+  lv_obj_set_flex_flow(launchGrid, LV_FLEX_FLOW_ROW_WRAP);
+  lv_obj_set_flex_align(
+      launchGrid,
+      LV_FLEX_ALIGN_CENTER,
+      LV_FLEX_ALIGN_CENTER,
+      LV_FLEX_ALIGN_CENTER);
+
+  const int16_t launchBtnW = 96;
+  const int16_t launchBtnH = 96;
+
+  lv_obj_t* btnAssistant = lv_btn_create(launchGrid);
+  lv_obj_set_size(btnAssistant, launchBtnW, launchBtnH);
+  uiStyleLauncherButton(btnAssistant, 0x0EA5E9, 0x0D2236);
+  lv_obj_add_event_cb(btnAssistant, uiOpenAssistantTabEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* lblAssistant = lv_label_create(btnAssistant);
+  lv_label_set_text(lblAssistant, "Assistant\nStatus");
+  lv_label_set_long_mode(lblAssistant, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(lblAssistant, 92);
+  lv_obj_set_style_text_align(lblAssistant, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_center(lblAssistant);
+
+  lv_obj_t* btnControls = lv_btn_create(launchGrid);
+  lv_obj_set_size(btnControls, launchBtnW, launchBtnH);
+  uiStyleLauncherButton(btnControls, 0x22C55E, 0x0D2A1D);
+  lv_obj_add_event_cb(btnControls, uiOpenControlsTabEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* lblControls = lv_label_create(btnControls);
+  lv_label_set_text(lblControls, "Controls");
+  lv_obj_set_style_text_align(lblControls, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_center(lblControls);
+
+  lv_obj_t* btnDiagnostics = lv_btn_create(launchGrid);
+  lv_obj_set_size(btnDiagnostics, launchBtnW, launchBtnH);
+  uiStyleLauncherButton(btnDiagnostics, 0xF59E0B, 0x2C210C);
+  lv_obj_add_event_cb(btnDiagnostics, uiOpenDiagnosticsTabEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* lblDiagnostics = lv_label_create(btnDiagnostics);
+  lv_label_set_text(lblDiagnostics, "Diagnostics");
+  lv_obj_set_style_text_align(lblDiagnostics, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_center(lblDiagnostics);
+
+  lv_obj_t* btnLogs = lv_btn_create(launchGrid);
+  lv_obj_set_size(btnLogs, launchBtnW, launchBtnH);
+  uiStyleLauncherButton(btnLogs, 0xA78BFA, 0x231C38);
+  lv_obj_add_event_cb(btnLogs, uiOpenLogsTabEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* lblLogs = lv_label_create(btnLogs);
+  lv_label_set_text(lblLogs, "Logs");
+  lv_obj_set_style_text_align(lblLogs, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_center(lblLogs);
+
+  uiBuildSubmenuHeader(tabAssistant, "Assistant");
+  lv_obj_t* assistantPanel = lv_obj_create(tabAssistant);
+  lv_obj_set_size(assistantPanel, SCREEN_WIDTH - 12, SCREEN_HEIGHT - 46);
+  lv_obj_align(assistantPanel, LV_ALIGN_TOP_MID, 0, 40);
+  uiStylePanel(assistantPanel, 0x090D14, 0x263245);
+  lv_obj_set_style_pad_all(assistantPanel, 8, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(assistantPanel, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_clear_flag(assistantPanel, LV_OBJ_FLAG_SCROLLABLE);
+
+  uiLabelAssistantState = lv_label_create(assistantPanel);
+  lv_label_set_text(uiLabelAssistantState, "State: Booting");
+  lv_obj_set_width(uiLabelAssistantState, SCREEN_WIDTH - 30);
+  lv_obj_align(uiLabelAssistantState, LV_ALIGN_TOP_LEFT, 0, 0);
+
+  uiLabelAssistantDetail = lv_label_create(assistantPanel);
+  lv_label_set_text(uiLabelAssistantDetail, "Starting...");
+  lv_obj_set_width(uiLabelAssistantDetail, SCREEN_WIDTH - 30);
+  lv_obj_align(uiLabelAssistantDetail, LV_ALIGN_TOP_LEFT, 0, 24);
+  lv_label_set_long_mode(uiLabelAssistantDetail, LV_LABEL_LONG_WRAP);
+
+  uiLabelAssistantWifi = lv_label_create(assistantPanel);
+  lv_label_set_text(uiLabelAssistantWifi, "Wi-Fi: offline");
+  lv_obj_set_width(uiLabelAssistantWifi, SCREEN_WIDTH - 30);
+  lv_obj_align(uiLabelAssistantWifi, LV_ALIGN_TOP_LEFT, 0, 82);
+
+  uiLabelAssistantMic = lv_label_create(assistantPanel);
+  lv_label_set_text(uiLabelAssistantMic, "Mic: idle");
+  lv_obj_set_width(uiLabelAssistantMic, SCREEN_WIDTH - 30);
+  lv_obj_align(uiLabelAssistantMic, LV_ALIGN_TOP_LEFT, 0, 106);
+
+  uiLabelAssistantHint = lv_label_create(assistantPanel);
+  lv_label_set_text(uiLabelAssistantHint, "Tap Capture from Controls");
+  lv_obj_set_width(uiLabelAssistantHint, SCREEN_WIDTH - 30);
+  lv_obj_align(uiLabelAssistantHint, LV_ALIGN_TOP_LEFT, 0, 134);
+  lv_label_set_long_mode(uiLabelAssistantHint, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_color(uiLabelAssistantHint, lv_color_hex(0x94A3B8), LV_PART_MAIN);
+
+  uiBuildSubmenuHeader(tabControls, "Controls");
+  lv_obj_t* controlsPanel = lv_obj_create(tabControls);
+  lv_obj_set_size(controlsPanel, SCREEN_WIDTH - 12, SCREEN_HEIGHT - 46);
+  lv_obj_align(controlsPanel, LV_ALIGN_TOP_MID, 0, 40);
+  uiStylePanel(controlsPanel, 0x0A1017, 0x243447);
+  lv_obj_set_style_pad_all(controlsPanel, 8, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(controlsPanel, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_clear_flag(controlsPanel, LV_OBJ_FLAG_SCROLLABLE);
+
+  uiBtnControlCapture = lv_btn_create(controlsPanel);
+  lv_obj_set_size(uiBtnControlCapture, 104, 78);
+  lv_obj_align(uiBtnControlCapture, LV_ALIGN_TOP_LEFT, 0, 0);
+  uiStyleLauncherButton(uiBtnControlCapture, 0x38BDF8, 0x0D2236);
+  lv_obj_add_event_cb(uiBtnControlCapture, uiCaptureButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* captureLabel = lv_label_create(uiBtnControlCapture);
+  lv_label_set_text(captureLabel, "Capture");
+  lv_obj_center(captureLabel);
+
+  uiBtnControlRepeat = lv_btn_create(controlsPanel);
+  lv_obj_set_size(uiBtnControlRepeat, 104, 78);
+  lv_obj_align(uiBtnControlRepeat, LV_ALIGN_TOP_RIGHT, 0, 0);
+  uiStyleLauncherButton(uiBtnControlRepeat, 0x2DD4BF, 0x102721);
+  lv_obj_add_event_cb(uiBtnControlRepeat, uiRepeatButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* repeatLabel = lv_label_create(uiBtnControlRepeat);
+  lv_label_set_text(repeatLabel, "Repeat");
+  lv_obj_center(repeatLabel);
+
+  uiBtnControlWifi = lv_btn_create(controlsPanel);
+  lv_obj_set_size(uiBtnControlWifi, 104, 78);
+  lv_obj_align(uiBtnControlWifi, LV_ALIGN_TOP_LEFT, 0, 88);
+  uiStyleLauncherButton(uiBtnControlWifi, 0xF59E0B, 0x2E230F);
+  lv_obj_add_event_cb(uiBtnControlWifi, uiWifiRetryButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* wifiLabel = lv_label_create(uiBtnControlWifi);
+  lv_label_set_text(wifiLabel, "Reconnect");
+  lv_obj_center(wifiLabel);
+
+  uiBtnControlRecover = lv_btn_create(controlsPanel);
+  lv_obj_set_size(uiBtnControlRecover, 104, 78);
+  lv_obj_align(uiBtnControlRecover, LV_ALIGN_TOP_RIGHT, 0, 88);
+  uiStyleLauncherButton(uiBtnControlRecover, 0xEF4444, 0x30161A);
+  lv_obj_add_event_cb(uiBtnControlRecover, uiRecoverAudioButtonEventCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* recoverLabel = lv_label_create(uiBtnControlRecover);
+  lv_label_set_text(recoverLabel, "Recover");
+  lv_obj_center(recoverLabel);
+
+  uiLabelControlsStatus = lv_label_create(controlsPanel);
+  lv_label_set_text(uiLabelControlsStatus, "Controls ready");
+  lv_obj_set_width(uiLabelControlsStatus, SCREEN_WIDTH - 30);
+  lv_obj_align(uiLabelControlsStatus, LV_ALIGN_BOTTOM_LEFT, 0, -6);
+  lv_label_set_long_mode(uiLabelControlsStatus, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_color(uiLabelControlsStatus, lv_color_hex(0x9FB3CF), LV_PART_MAIN);
+
+  uiBuildSubmenuHeader(tabDiagnostics, "Diagnostics");
+  lv_obj_t* diagPanel = lv_obj_create(tabDiagnostics);
+  lv_obj_set_size(diagPanel, SCREEN_WIDTH - 12, SCREEN_HEIGHT - 46);
+  lv_obj_align(diagPanel, LV_ALIGN_TOP_MID, 0, 40);
+  uiStylePanel(diagPanel, 0x0A0C10, 0x3A2E1C);
+  lv_obj_set_style_pad_all(diagPanel, 8, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(diagPanel, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_clear_flag(diagPanel, LV_OBJ_FLAG_SCROLLABLE);
+
+  uiLabelDiagnosticsRun = lv_label_create(diagPanel);
+  lv_label_set_text(uiLabelDiagnosticsRun, "Last run: (none)");
+  lv_obj_set_width(uiLabelDiagnosticsRun, SCREEN_WIDTH - 30);
+  lv_obj_align(uiLabelDiagnosticsRun, LV_ALIGN_TOP_LEFT, 0, 0);
+
+  uiLabelDiagnosticsStageA = lv_label_create(diagPanel);
+  lv_label_set_text(uiLabelDiagnosticsStageA, "L - | STT - | AI -");
+  lv_obj_set_width(uiLabelDiagnosticsStageA, SCREEN_WIDTH - 30);
+  lv_obj_align(uiLabelDiagnosticsStageA, LV_ALIGN_TOP_LEFT, 0, 24);
+
+  uiLabelDiagnosticsStageB = lv_label_create(diagPanel);
+  lv_label_set_text(uiLabelDiagnosticsStageB, "TU - | TP - | OK 0 | ER 0");
+  lv_obj_set_width(uiLabelDiagnosticsStageB, SCREEN_WIDTH - 30);
+  lv_obj_align(uiLabelDiagnosticsStageB, LV_ALIGN_TOP_LEFT, 0, 48);
+
+  uiLabelDiagnosticsRuntime = lv_label_create(diagPanel);
+  lv_label_set_text(uiLabelDiagnosticsRuntime, "Heap: pending");
+  lv_obj_set_width(uiLabelDiagnosticsRuntime, SCREEN_WIDTH - 30);
+  lv_obj_align(uiLabelDiagnosticsRuntime, LV_ALIGN_TOP_LEFT, 0, 78);
+  lv_label_set_long_mode(uiLabelDiagnosticsRuntime, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_color(uiLabelDiagnosticsRuntime, lv_color_hex(0x9FB3CF), LV_PART_MAIN);
+
+  uiBuildSubmenuHeader(tabLogs, "Logs");
+  lv_obj_t* logsPanel = lv_obj_create(tabLogs);
+  lv_obj_set_size(logsPanel, SCREEN_WIDTH - 12, SCREEN_HEIGHT - 46);
+  lv_obj_align(logsPanel, LV_ALIGN_TOP_MID, 0, 40);
+  uiStylePanel(logsPanel, 0x0A0F1A, 0x2D3650);
+  lv_obj_set_style_pad_all(logsPanel, 8, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(logsPanel, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_clear_flag(logsPanel, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t* transcriptLabel = lv_label_create(logsPanel);
+  lv_label_set_text(transcriptLabel, "Transcript");
+  lv_obj_set_style_text_color(transcriptLabel, lv_color_hex(0xFDE68A), LV_PART_MAIN);
+  lv_obj_align(transcriptLabel, LV_ALIGN_TOP_LEFT, 0, 0);
+
+  uiTaTranscript = lv_textarea_create(logsPanel);
+  lv_obj_set_size(uiTaTranscript, SCREEN_WIDTH - 30, 102);
+  lv_obj_align(uiTaTranscript, LV_ALIGN_TOP_LEFT, 0, 18);
+  lv_textarea_set_text(uiTaTranscript, "(none)");
+  lv_obj_set_style_radius(uiTaTranscript, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiTaTranscript, lv_color_hex(0x101928), LV_PART_MAIN);
+  lv_obj_set_style_text_color(uiTaTranscript, lv_color_hex(0xEAF2FF), LV_PART_MAIN);
+  lv_obj_clear_flag(uiTaTranscript, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(uiTaTranscript, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+  lv_obj_set_scrollbar_mode(uiTaTranscript, LV_SCROLLBAR_MODE_ACTIVE);
+
+  lv_obj_t* replyLabel = lv_label_create(logsPanel);
+  lv_label_set_text(replyLabel, "Reply");
+  lv_obj_set_style_text_color(replyLabel, lv_color_hex(0xFDE68A), LV_PART_MAIN);
+  lv_obj_align(replyLabel, LV_ALIGN_TOP_LEFT, 0, 126);
+
+  uiTaReply = lv_textarea_create(logsPanel);
+  lv_obj_set_size(uiTaReply, SCREEN_WIDTH - 30, 112);
+  lv_obj_align(uiTaReply, LV_ALIGN_TOP_LEFT, 0, 144);
+  lv_textarea_set_text(uiTaReply, "(none)");
+  lv_obj_set_style_radius(uiTaReply, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(uiTaReply, lv_color_hex(0x101928), LV_PART_MAIN);
+  lv_obj_set_style_text_color(uiTaReply, lv_color_hex(0xEAF2FF), LV_PART_MAIN);
+  lv_obj_clear_flag(uiTaReply, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(uiTaReply, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+  lv_obj_set_scrollbar_mode(uiTaReply, LV_SCROLLBAR_MODE_ACTIVE);
+
+  lv_tabview_set_act(uiTabview, UI_TAB_INDEX_LAUNCHER, LV_ANIM_OFF);
+  uiSetControlsStatus("Controls ready");
+}
+
+void uiUpdateStatus(uint32_t nowMs) {
+  const uint32_t stateAgeSec = (nowMs - stateEnteredAtMs) / 1000;
+  const bool busy =
+      state == AssistantState::Listening ||
+      state == AssistantState::Transcribing ||
+      state == AssistantState::Thinking ||
+      state == AssistantState::Speaking;
+
+  String wifiLine;
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiLine = clipText(String("Wi-Fi: ") + WiFi.SSID() + "  " + String(WiFi.RSSI()) + " dBm", 48);
+  } else if (wifiReconnectPending) {
+    int32_t waitMs = static_cast<int32_t>(wifiNextRetryAtMs - nowMs);
+    if (waitMs < 0) {
+      waitMs = 0;
+    }
+    wifiLine = String("Wi-Fi retry in ") + String((waitMs + 999) / 1000) + "s";
   } else {
-    renderUiFrame(tft, nowMs);
+    wifiLine = "Wi-Fi: disconnected";
+  }
+
+  const String stateLine = String("State: ") + stateName(state) + "  " + stateAgeSec + "s";
+  if (uiLabelLauncherState) {
+    lv_label_set_text(uiLabelLauncherState, clipText(stateLine, 48).c_str());
+    lv_obj_set_style_text_color(uiLabelLauncherState, uiStateColor(state), LV_PART_MAIN);
+  }
+  if (uiLabelLauncherWifi) {
+    lv_label_set_text(uiLabelLauncherWifi, clipText(wifiLine, 48).c_str());
+    lv_obj_set_style_text_color(
+        uiLabelLauncherWifi,
+        WiFi.status() == WL_CONNECTED ? lv_color_hex(0x86EFAC) : lv_color_hex(0xFCA5A5),
+        LV_PART_MAIN);
+  }
+  if (uiLabelAssistantState) {
+    lv_label_set_text(uiLabelAssistantState, clipText(stateLine, 60).c_str());
+    lv_obj_set_style_text_color(uiLabelAssistantState, uiStateColor(state), LV_PART_MAIN);
+  }
+  if (uiLabelAssistantDetail) {
+    lv_label_set_text(uiLabelAssistantDetail, clipText(String("Detail: ") + stateDetail, 110).c_str());
+    lv_obj_set_style_text_color(
+        uiLabelAssistantDetail,
+        state == AssistantState::Error ? lv_color_hex(0xF87171) : lv_color_hex(0xCBD5E1),
+        LV_PART_MAIN);
+  }
+  if (uiLabelAssistantWifi) {
+    lv_label_set_text(uiLabelAssistantWifi, clipText(wifiLine, 60).c_str());
+    lv_obj_set_style_text_color(
+        uiLabelAssistantWifi,
+        WiFi.status() == WL_CONNECTED ? lv_color_hex(0x86EFAC) : lv_color_hex(0xFCA5A5),
+        LV_PART_MAIN);
+  }
+  if (uiLabelAssistantMic) {
+    String micLine;
+    if (state == AssistantState::Listening) {
+      micLine =
+          String("Mic live: ") +
+          String(listeningCapturedMs / 1000.0f, 1) + "s  rms " + String(listeningFrameRms, 4) +
+          "  pk " + String(listeningFramePeak, 4);
+    } else {
+      micLine =
+          String("Last cap: ") +
+          formatMsCompact(lastCaptureMs) +
+          "  rms " + String(lastCaptureRms, 4) +
+          "  pk " + String(lastCapturePeak, 4);
+    }
+    lv_label_set_text(uiLabelAssistantMic, clipText(micLine, 64).c_str());
+    lv_obj_set_style_text_color(uiLabelAssistantMic, lv_color_hex(0xA5F3FC), LV_PART_MAIN);
+  }
+  if (uiLabelAssistantHint) {
+    String hint = String(uiStateHint(state));
+    if (state == AssistantState::Idle) {
+      hint += String(" | HF ") + (handsFreeEnabled ? "on" : "off");
+    }
+    lv_label_set_text(uiLabelAssistantHint, clipText(hint, 84).c_str());
+  }
+
+  if (uiBtnControlCapture) {
+    if (busy) {
+      lv_obj_add_state(uiBtnControlCapture, LV_STATE_DISABLED);
+    } else {
+      lv_obj_clear_state(uiBtnControlCapture, LV_STATE_DISABLED);
+    }
+  }
+  if (uiBtnControlRepeat) {
+    if (busy || lastReply.length() == 0) {
+      lv_obj_add_state(uiBtnControlRepeat, LV_STATE_DISABLED);
+    } else {
+      lv_obj_clear_state(uiBtnControlRepeat, LV_STATE_DISABLED);
+    }
+  }
+  if (uiBtnControlWifi) {
+    if (busy) {
+      lv_obj_add_state(uiBtnControlWifi, LV_STATE_DISABLED);
+    } else {
+      lv_obj_clear_state(uiBtnControlWifi, LV_STATE_DISABLED);
+    }
+  }
+  if (uiBtnControlRecover) {
+    if (busy) {
+      lv_obj_add_state(uiBtnControlRecover, LV_STATE_DISABLED);
+    } else {
+      lv_obj_clear_state(uiBtnControlRecover, LV_STATE_DISABLED);
+    }
+  }
+
+  if (uiLabelDiagnosticsRun) {
+    const String runLine =
+        String("Last run: ") +
+        clipText(lastCycleResult, 18) +
+        "  total " + formatMsCompact(lastCycleTotalMs);
+    lv_label_set_text(uiLabelDiagnosticsRun, clipText(runLine, 62).c_str());
+  }
+  if (uiLabelDiagnosticsStageA) {
+    const String stageA =
+        String("L ") + formatMsCompact(lastCycleListeningMs) +
+        "  STT " + formatMsCompact(lastCycleSttMs) +
+        "  AI " + formatMsCompact(lastCycleThinkingMs);
+    lv_label_set_text(uiLabelDiagnosticsStageA, clipText(stageA, 62).c_str());
+  }
+  if (uiLabelDiagnosticsStageB) {
+    const String stageB =
+        String("TU ") + formatMsCompact(lastCycleTtsUrlMs) +
+        "  TP " + formatMsCompact(lastCyclePlaybackMs) +
+        "  OK " + successfulCycleCount +
+        "  ER " + errorStateCount;
+    lv_label_set_text(uiLabelDiagnosticsStageB, clipText(stageB, 62).c_str());
+  }
+  if (uiLabelDiagnosticsRuntime) {
+    String runtimeLine =
+        String("Heap ") + (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024) + "k";
+    if (psramFound()) {
+      runtimeLine += String(" | PS ") + (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024) + "k";
+    }
+    runtimeLine += String(" | Wake ") + ((localWakeEnabled && localWakeReady) ? "on" : "off");
+    lv_label_set_text(uiLabelDiagnosticsRuntime, clipText(runtimeLine, 78).c_str());
+  }
+
+  static String shownTranscript;
+  static String shownReply;
+  const String transcript = lastTranscript.length() ? lastTranscript : "(none)";
+  const String reply = lastReply.length() ? lastReply : "(none)";
+  if (uiTaTranscript && transcript != shownTranscript) {
+    lv_textarea_set_text(uiTaTranscript, transcript.c_str());
+    shownTranscript = transcript;
+  }
+  if (uiTaReply && reply != shownReply) {
+    lv_textarea_set_text(uiTaReply, reply.c_str());
+    shownReply = reply;
   }
 }
 
@@ -526,6 +1088,9 @@ void listeningCaptureProgressCallback(
 }
 
 void setState(AssistantState nextState, const String& detail) {
+  if (nextState == AssistantState::Error && state != AssistantState::Error) {
+    errorStateCount++;
+  }
   state = nextState;
   stateDetail = detail;
   stateEnteredAtMs = millis();
@@ -2392,17 +2957,15 @@ void pollBootButton(uint32_t nowMs) {
 
   if (pressedNow && !bootPressed) {
     bootPressed = true;
-    bootPressStartMs = nowMs;
+    if (nowMs - bootLastTriggerMs >= 220) {
+      bootLastTriggerMs = nowMs;
+      requestCapture(CaptureRequestSource::Boot, "BOOT");
+    }
     return;
   }
 
   if (!pressedNow && bootPressed) {
-    const uint32_t heldMs = nowMs - bootPressStartMs;
     bootPressed = false;
-
-    if (heldMs < 1200) {
-      requestCapture(CaptureRequestSource::Boot, "BOOT");
-    }
   }
 }
 
@@ -2419,8 +2982,12 @@ esp_err_t localWakeFillCb(void* arg, void* out, size_t len, size_t* bytesRead, u
     vTaskDelay(pdMS_TO_TICKS(20));
     return ESP_FAIL;
   }
+  // Allow SR startup while we're still in Booting; otherwise sr_start can
+  // stall waiting for audio because this callback rejects non-idle states.
   const bool wakeAcceptingState =
-      state == AssistantState::Idle || state == AssistantState::Error;
+      state == AssistantState::Booting ||
+      state == AssistantState::Idle ||
+      state == AssistantState::Error;
   if (!audioReady || !wakeAcceptingState || captureRequested) {
     vTaskDelay(pdMS_TO_TICKS(12));
     return ESP_FAIL;
@@ -2450,15 +3017,6 @@ void localWakeEventCb(void* arg, sr_event_t event, int commandId, int phraseId) 
   }
 }
 
-String formatMsCompact(uint32_t ms) {
-  if (ms == 0) {
-    return "-";
-  }
-  if (ms >= 10000) {
-    return String(ms / 1000) + "s";
-  }
-  return String(ms / 1000.0f, 1) + "s";
-}
 #endif
 
 bool startLocalWakeEngine(String& outError) {
@@ -2552,6 +3110,49 @@ void resumeLocalWakeEngine() {
     localWakePhraseId = -1;
     sr_set_mode(SR_MODE_COMMAND);
   }
+#endif
+}
+
+void localWakeStartTask(void* arg) {
+  (void)arg;
+  String wakeErr;
+  const bool started = startLocalWakeEngine(wakeErr);
+  if (!started) {
+    localWakeEnabled = false;
+    localWakeReady = false;
+    Serial.println(
+        String("[WAKE] local disabled: ") +
+        (wakeErr.length() ? wakeErr : "start failed"));
+  }
+  localWakeStartInProgress = false;
+  localWakeStartTaskHandle = nullptr;
+  vTaskDelete(nullptr);
+}
+
+void queueLocalWakeStart(const char* reason) {
+#if ASSISTANT_HAS_LOCAL_SR
+  if (!localWakeEnabled || !handsFreeEnabled || localWakeReady || localWakeStartInProgress) {
+    return;
+  }
+  localWakeStartInProgress = true;
+  BaseType_t created = xTaskCreate(
+      localWakeStartTask,
+      "wake-start",
+      8192,
+      nullptr,
+      1,
+      &localWakeStartTaskHandle);
+  if (created != pdPASS) {
+    localWakeStartTaskHandle = nullptr;
+    localWakeStartInProgress = false;
+    localWakeEnabled = false;
+    localWakeReady = false;
+    Serial.println("[WAKE] local disabled: start task create failed");
+    return;
+  }
+  Serial.println(String("[WAKE] local start queued: ") + reason);
+#else
+  (void)reason;
 #endif
 }
 
@@ -2783,11 +3384,7 @@ bool recoverAudioPipeline(const String& reason, bool restartWakeEngine) {
   }
 
   if (restartWakeEngine && localWakeEnabled) {
-    String wakeErr;
-    if (!startLocalWakeEngine(wakeErr)) {
-      Serial.println(String("[WAKE] restart failed: ") + wakeErr);
-      localWakeEnabled = false;
-    }
+    queueLocalWakeStart("recover");
   }
 
   Serial.println(
@@ -2845,25 +3442,47 @@ void pollRuntimeHealth(uint32_t nowMs) {
 }
 
 void runAssistantCycle(CaptureRequestSource triggerSource) {
+  const uint32_t cycleStartedMs = millis();
+  lastCycleTotalMs = 0;
+  lastCycleListeningMs = 0;
+  lastCycleSttMs = 0;
+  lastCycleThinkingMs = 0;
+  lastCycleTtsUrlMs = 0;
+  lastCyclePlaybackMs = 0;
+  lastCycleResult = "running";
+
+  const auto finishCycle = [&](const String& result, bool success) {
+    lastCycleTotalMs = millis() - cycleStartedMs;
+    lastCycleResult = clipText(result, 26);
+    if (success) {
+      successfulCycleCount++;
+    }
+    uiDirty = true;
+  };
+
   if (!audioReady) {
     setState(AssistantState::Error, "Audio not initialized");
+    finishCycle("audio not ready", false);
     return;
   }
 
   if (WiFi.status() != WL_CONNECTED) {
     setState(AssistantState::Error, "Wi-Fi disconnected");
     scheduleWifiReconnect(millis(), true, "capture while offline");
+    finishCycle("wifi disconnected", false);
     return;
   }
 
   if (!isHomeAssistantConfigured()) {
     setState(AssistantState::Error, "HA not configured in secrets.h");
+    finishCycle("ha not configured", false);
     return;
   }
 
   String authErr;
   if (!ensureHaAuthReady(authErr)) {
     setState(AssistantState::Error, "HA auth failed: " + clipText(authErr, 45));
+    finishCycle("ha auth failed", false);
     return;
   }
 
@@ -2885,6 +3504,7 @@ void runAssistantCycle(CaptureRequestSource triggerSource) {
     }
     softRecoverRuntime(
         String(label) + " timeout " + elapsedMs + "/" + timeoutMs + "ms");
+    finishCycle(String(label) + " timeout", false);
     return true;
   };
 
@@ -2939,8 +3559,10 @@ void runAssistantCycle(CaptureRequestSource triggerSource) {
           nullptr)) {
     if (recoverAudioPipeline("capture stall", true)) {
       setState(AssistantState::Idle, "Recovered: mic capture stall");
+      finishCycle("mic stall recovered", false);
     } else {
       setState(AssistantState::Error, "Microphone capture failed");
+      finishCycle("mic capture failed", false);
     }
     return;
   }
@@ -2948,6 +3570,7 @@ void runAssistantCycle(CaptureRequestSource triggerSource) {
   if (stageExpired(AssistantState::Listening, listeningStartedMs, "listening")) {
     return;
   }
+  lastCycleListeningMs = millis() - listeningStartedMs;
 
   lastCaptureSamples = captureResult.sampleCount;
   lastCaptureMs = captureResult.speechMs;
@@ -2961,11 +3584,13 @@ void runAssistantCycle(CaptureRequestSource triggerSource) {
 
   if (!captureResult.speechDetected || captureResult.sampleCount == 0) {
     setState(AssistantState::Idle, "No speech detected");
+    finishCycle("no speech", false);
     return;
   }
   if (captureResult.metrics.rmsNorm < CAPTURE_MIN_RMS &&
       captureResult.metrics.peakNorm < CAPTURE_MIN_PEAK) {
     setState(AssistantState::Idle, "Speech too quiet");
+    finishCycle("speech too quiet", false);
     return;
   }
 
@@ -2988,11 +3613,14 @@ void runAssistantCycle(CaptureRequestSource triggerSource) {
   String sttErr;
   if (!homeAssistantStt(captureBuffer, sttSampleCount, transcript, sttErr)) {
     setState(AssistantState::Error, "STT failed: " + sttErr);
+    lastCycleSttMs = millis() - transcribingStartedMs;
+    finishCycle("stt failed", false);
     return;
   }
   if (stageExpired(AssistantState::Transcribing, transcribingStartedMs, "transcribing")) {
     return;
   }
+  lastCycleSttMs = millis() - transcribingStartedMs;
 
   setTranscript(transcript);
   setState(AssistantState::Thinking, "Calling conversation");
@@ -3003,16 +3631,20 @@ void runAssistantCycle(CaptureRequestSource triggerSource) {
   String convErr;
   if (!homeAssistantConversation(transcript, reply, convErr)) {
     setState(AssistantState::Error, "Conversation failed: " + clipText(convErr, 48));
+    lastCycleThinkingMs = millis() - thinkingStartedMs;
+    finishCycle("conversation failed", false);
     return;
   }
   if (stageExpired(AssistantState::Thinking, thinkingStartedMs, "thinking")) {
     return;
   }
+  lastCycleThinkingMs = millis() - thinkingStartedMs;
 
   setReply(reply);
 
   if (strlen(HA_TTS_ENGINE_ID) == 0) {
     setState(AssistantState::Idle, "Reply ready (TTS disabled)");
+    finishCycle("ok (tts off)", true);
     return;
   }
 
@@ -3022,30 +3654,40 @@ void runAssistantCycle(CaptureRequestSource triggerSource) {
 
   String ttsUrl;
   String ttsErr;
+  const uint32_t ttsUrlStartedMs = millis();
   if (!homeAssistantTtsGetUrl(reply, ttsUrl, ttsErr)) {
     setState(AssistantState::Error, "TTS URL failed: " + clipText(ttsErr, 50));
+    lastCycleTtsUrlMs = millis() - ttsUrlStartedMs;
+    finishCycle("tts url failed", false);
     return;
   }
+  lastCycleTtsUrlMs = millis() - ttsUrlStartedMs;
   if (stageExpired(AssistantState::Speaking, speakingStartedMs, "speaking(tts-url)")) {
     return;
   }
 
+  const uint32_t playbackStartedMs = millis();
   if (!homeAssistantPlayTtsWav(ttsUrl, ttsErr)) {
+    lastCyclePlaybackMs = millis() - playbackStartedMs;
     const bool likelyAudioStall =
         ttsErr.indexOf("playback failed") >= 0 ||
         ttsErr.indexOf("WAV stream timeout") >= 0;
     if (likelyAudioStall && recoverAudioPipeline("tts playback stall", true)) {
       setState(AssistantState::Idle, "Recovered: TTS playback stall");
+      finishCycle("tts stall recovered", false);
       return;
     }
     setState(AssistantState::Error, "TTS playback failed: " + clipText(ttsErr, 44));
+    finishCycle("tts playback failed", false);
     return;
   }
+  lastCyclePlaybackMs = millis() - playbackStartedMs;
   if (stageExpired(AssistantState::Speaking, speakingStartedMs, "speaking(playback)")) {
     return;
   }
 
   setState(AssistantState::Idle, "Ready");
+  finishCycle("ok", true);
 }
 void setup() {
   Serial.begin(115200);
@@ -3065,17 +3707,35 @@ void setup() {
   tft.begin();
   tft.setRotation(0);
   tft.fillScreen(TFT_BLACK);
-  uiSprite.setColorDepth(16);
-  uiSpriteReady = uiSprite.createSprite(SCREEN_WIDTH, SCREEN_HEIGHT) != nullptr;
-  if (!uiSpriteReady) {
-    Serial.println("[UI] Sprite allocate failed; using direct TFT rendering");
-  }
+  lv_init();
+  lv_disp_draw_buf_init(&lvDrawBuf, lvDrawPixels, nullptr, SCREEN_WIDTH * 20);
+
+  static lv_disp_drv_t dispDrv;
+  lv_disp_drv_init(&dispDrv);
+  dispDrv.hor_res = SCREEN_WIDTH;
+  dispDrv.ver_res = SCREEN_HEIGHT;
+  dispDrv.flush_cb = lvglFlushCb;
+  dispDrv.draw_buf = &lvDrawBuf;
+  lv_disp_drv_register(&dispDrv);
+
+  static lv_indev_drv_t indevDrv;
+  lv_indev_drv_init(&indevDrv);
+  indevDrv.type = LV_INDEV_TYPE_POINTER;
+  indevDrv.read_cb = lvglTouchReadCb;
+  lv_indev_drv_register(&indevDrv);
 
   loadWifiConfig();
   reconnectSsid = configuredSsid;
   reconnectPassword = configuredPassword;
 
-  Wire.begin(PIN_TOUCH_SDA, PIN_TOUCH_SCL, 400000);
+  touchReady = touch.begin(PIN_TOUCH_SDA, PIN_TOUCH_SCL, PIN_TOUCH_RST, PIN_TOUCH_INT, 400000, false);
+  if (!touchReady) {
+    Serial.println("[UI] Touch init failed; launcher will be display-only");
+  }
+  buildUi();
+  uiReady = true;
+  uiDirty = true;
+  drawScreen(true);
 
   const bool codecReady = codec.begin(Wire, 0x18);
   audioReady = codecReady && micCapture.begin(codec, CAPTURE_SAMPLE_RATE);
@@ -3124,12 +3784,7 @@ void setup() {
   Serial.println("[WAKE] phrases: ok mister bob | okay mister bob");
 #endif
   if (localWakeEnabled) {
-    String wakeErr;
-    if (!startLocalWakeEngine(wakeErr)) {
-      localWakeEnabled = false;
-      localWakeReady = false;
-      Serial.println(String("[WAKE] local disabled: ") + wakeErr);
-    }
+    queueLocalWakeStart("boot");
   }
 
   WiFi.mode(WIFI_STA);
@@ -3165,6 +3820,50 @@ void loop() {
   pollHandsFreeTrigger(nowMs);
   pollWifiConnection(nowMs);
   pollRuntimeHealth(nowMs);
+
+  if (uiActionCapture) {
+    uiActionCapture = false;
+    if (stateBusy()) {
+      uiSetControlsStatus("Busy; wait for current cycle");
+    } else {
+      requestCapture(CaptureRequestSource::Unknown, "UI");
+      uiSetControlsStatus("Capture queued");
+    }
+  }
+
+  if (uiActionRepeat) {
+    uiActionRepeat = false;
+    if (stateBusy()) {
+      uiSetControlsStatus("Busy; cannot repeat now");
+    } else {
+      uiSetControlsStatus("Repeating last reply");
+      handleLocalRepeatCommand();
+    }
+  }
+
+  if (uiActionWifiRetry) {
+    uiActionWifiRetry = false;
+    if (stateBusy()) {
+      uiSetControlsStatus("Busy; reconnect deferred");
+    } else {
+      if (WiFi.status() == WL_CONNECTED) {
+        WiFi.disconnect();
+      }
+      scheduleWifiReconnect(nowMs, true, "manual UI reconnect");
+      setState(AssistantState::ConnectingWiFi, "Manual Wi-Fi reconnect");
+      uiSetControlsStatus("Wi-Fi reconnect scheduled");
+    }
+  }
+
+  if (uiActionRecoverAudio) {
+    uiActionRecoverAudio = false;
+    if (stateBusy()) {
+      uiSetControlsStatus("Busy; recover after cycle");
+    } else {
+      uiSetControlsStatus("Recovering audio pipeline");
+      softRecoverRuntime("manual UI recovery");
+    }
+  }
 
   if (captureRequested && (state == AssistantState::Idle || state == AssistantState::Error)) {
     const CaptureRequestSource triggerSource = captureSource;

@@ -25,6 +25,10 @@ downloads/
 # Serial/debug logs
 *.log
 
+# Local audio test artifacts
+stt_test_*.wav
+tts_probe.wav
+
 # OS/editor cruft
 .DS_Store
 Thumbs.db

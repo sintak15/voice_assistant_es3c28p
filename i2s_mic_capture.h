@@ -1,16 +1,13 @@
 #pragma once
 
 #include <Arduino.h>
-#include <driver/i2s.h>
+#include <ESP_I2S.h>
+#include <esp_err.h>
 #include <math.h>
 #include <stdint.h>
 
 #include "board_pins.h"
 #include "es8311_codec.h"
-
-#ifndef I2S_COMM_FORMAT_STAND_I2S
-#define I2S_COMM_FORMAT_STAND_I2S I2S_COMM_FORMAT_I2S
-#endif
 
 struct CaptureMetrics {
   float rmsNorm = 0.0f;
@@ -36,6 +33,12 @@ struct CaptureResult {
   uint32_t speechMs = 0;
 };
 
+typedef void (*CaptureProgressCallback)(
+    const CaptureMetrics& frameMetrics,
+    bool speechStarted,
+    size_t capturedSamples,
+    void* userData);
+
 class I2SMicCapture {
  public:
   bool begin(Es8311Codec& codec, uint32_t sampleRate = 16000) {
@@ -54,44 +57,14 @@ class I2SMicCapture {
     // Max analog mic gain to improve capture on quieter ES8311 front-ends.
     codec.setMicGainDb(42);
 
-    const i2s_config_t i2sConfig = {
-        .mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_TX),
-        .sample_rate = static_cast<int>(sampleRate_),
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 8,
-        .dma_buf_len = 256,
-        .use_apll = false,
-        .tx_desc_auto_clear = true,
-        // Hosyond ES3C28P Example_30_ai_chat uses MCLK multiple of 384 at 16k.
-        .fixed_mclk = static_cast<int>(sampleRate_ * 384),
-    };
-
-    const esp_err_t installErr = i2s_driver_install(port_, &i2sConfig, 0, nullptr);
-    if (installErr != ESP_OK) {
+    i2s_.setPins(PIN_AUDIO_BCLK, PIN_AUDIO_LRCLK, PIN_AUDIO_DOUT, PIN_AUDIO_DIN, PIN_AUDIO_MCLK);
+    i2s_.setTimeout(100);
+    if (!i2s_.begin(I2S_MODE_STD, sampleRate_, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH)) {
       return false;
     }
 
-    const i2s_pin_config_t pinConfig = {
-        .mck_io_num = PIN_AUDIO_MCLK,
-        .bck_io_num = PIN_AUDIO_BCLK,
-        .ws_io_num = PIN_AUDIO_LRCLK,
-        .data_out_num = PIN_AUDIO_DOUT,
-        .data_in_num = PIN_AUDIO_DIN,
-    };
-
-    const esp_err_t pinErr = i2s_set_pin(port_, &pinConfig);
-    if (pinErr != ESP_OK) {
-      i2s_driver_uninstall(port_);
-      return false;
-    }
-
-    i2s_zero_dma_buffer(port_);
     activeSampleRate_ = sampleRate_;
-    activeChannels_ = static_cast<int>(I2S_CHANNEL_STEREO);
-    activeBitsPerSample_ = static_cast<int>(I2S_BITS_PER_SAMPLE_16BIT);
+    activeSlotMode_ = I2S_SLOT_MODE_STEREO;
     ready_ = true;
     // ES3C28P reference demos keep AP/EN low for both mic and speaker path.
     captureEnableHigh_ = false;
@@ -100,6 +73,19 @@ class I2SMicCapture {
     return true;
   }
 
+  bool end() {
+    if (!ready_) {
+      return true;
+    }
+    const bool ended = i2s_.end();
+    ready_ = false;
+    activeSampleRate_ = 0;
+    activeSlotMode_ = I2S_SLOT_MODE_MONO;
+    return ended;
+  }
+
+  bool isReady() const { return ready_; }
+
   bool captureBlocking(int16_t* out, size_t sampleCount, CaptureMetrics& metrics) {
     if (!ready_ || !out || sampleCount == 0) {
       return false;
@@ -107,7 +93,7 @@ class I2SMicCapture {
 
     setAudioEnable(false);
 
-    if (!setClock(sampleRate_, I2S_CHANNEL_STEREO, I2S_BITS_PER_SAMPLE_16BIT)) {
+    if (!setClock(sampleRate_, I2S_SLOT_MODE_STEREO)) {
       return false;
     }
 
@@ -120,15 +106,8 @@ class I2SMicCapture {
       const size_t framesToRead = framesRemaining < kMaxFramesPerRead ? framesRemaining : kMaxFramesPerRead;
       const size_t bytesToRead = framesToRead * sizeof(int16_t) * 2;
 
-      size_t bytesRead = 0;
-      const esp_err_t err = i2s_read(
-          port_,
-          reinterpret_cast<void*>(stereoSamples),
-          bytesToRead,
-          &bytesRead,
-          pdMS_TO_TICKS(1000));
-
-      if (err != ESP_OK || bytesRead == 0) {
+      const size_t bytesRead = i2s_.readBytes(reinterpret_cast<char*>(stereoSamples), bytesToRead);
+      if (bytesRead == 0) {
         return false;
       }
 
@@ -152,14 +131,20 @@ class I2SMicCapture {
     return true;
   }
 
-  bool captureVoiceCommand(int16_t* out, size_t maxSamples, const CaptureVadConfig& config, CaptureResult& outResult) {
+  bool captureVoiceCommand(
+      int16_t* out,
+      size_t maxSamples,
+      const CaptureVadConfig& config,
+      CaptureResult& outResult,
+      CaptureProgressCallback progressCallback = nullptr,
+      void* progressUserData = nullptr) {
     outResult = CaptureResult{};
     if (!ready_ || !out || maxSamples == 0) {
       return false;
     }
 
     setAudioEnable(false);
-    if (!setClock(sampleRate_, I2S_CHANNEL_STEREO, I2S_BITS_PER_SAMPLE_16BIT)) {
+    if (!setClock(sampleRate_, I2S_SLOT_MODE_STEREO)) {
       return false;
     }
 
@@ -225,14 +210,8 @@ class I2SMicCapture {
 
     while (captured < maxSamples) {
       const size_t bytesToRead = frameSamples * sizeof(int16_t) * 2;
-      size_t bytesRead = 0;
-      const esp_err_t err = i2s_read(
-          port_,
-          reinterpret_cast<void*>(stereoSamples),
-          bytesToRead,
-          &bytesRead,
-          pdMS_TO_TICKS(700));
-      if (err != ESP_OK || bytesRead == 0) {
+      const size_t bytesRead = i2s_.readBytes(reinterpret_cast<char*>(stereoSamples), bytesToRead);
+      if (bytesRead == 0) {
         return false;
       }
 
@@ -269,6 +248,10 @@ class I2SMicCapture {
       const bool frameAboveStop =
           frameMetrics.rmsNorm >= dynamicStopRms ||
           frameMetrics.peakNorm >= dynamicStopPeak;
+
+      if (progressCallback) {
+        progressCallback(frameMetrics, speechStarted, captured, progressUserData);
+      }
 
       if (!speechStarted) {
         if (frameHasVoice) {
@@ -316,6 +299,10 @@ class I2SMicCapture {
         out[captured++] = monoFrame[i];
       }
 
+      if (progressCallback) {
+        progressCallback(frameMetrics, speechStarted, captured, progressUserData);
+      }
+
       if (frameAboveStop) {
         voicedFrames++;
         silenceFrames = 0;
@@ -350,20 +337,14 @@ class I2SMicCapture {
     }
 
     setAudioEnable(false);
-    if (!setClock(sampleRate_, I2S_CHANNEL_STEREO, I2S_BITS_PER_SAMPLE_16BIT)) {
+    if (!setClock(sampleRate_, I2S_SLOT_MODE_STEREO)) {
       return false;
     }
 
     int16_t stereoSamples[256 * 2] = {0};
     const size_t bytesToRead = static_cast<size_t>(frames) * sizeof(int16_t) * 2;
-    size_t bytesRead = 0;
-    const esp_err_t err = i2s_read(
-        port_,
-        reinterpret_cast<void*>(stereoSamples),
-        bytesToRead,
-        &bytesRead,
-        pdMS_TO_TICKS(60));
-    if (err != ESP_OK || bytesRead == 0) {
+    const size_t bytesRead = i2s_.readBytes(reinterpret_cast<char*>(stereoSamples), bytesToRead);
+    if (bytesRead == 0) {
       return false;
     }
 
@@ -397,21 +378,14 @@ class I2SMicCapture {
     // Hosyond ES3C28P demos keep AP/EN low during playback.
     setAudioEnable(false);
 
-    if (!setClock(sampleRate, I2S_CHANNEL_MONO, I2S_BITS_PER_SAMPLE_16BIT)) {
+    if (!setClock(sampleRate, I2S_SLOT_MODE_MONO)) {
       return false;
     }
 
     size_t played = 0;
     while (played < byteCount) {
-      size_t bytesWritten = 0;
-      const esp_err_t err = i2s_write(
-          port_,
-          reinterpret_cast<const void*>(pcmBytes + played),
-          byteCount - played,
-          &bytesWritten,
-          pdMS_TO_TICKS(1000));
-
-      if (err != ESP_OK || bytesWritten == 0) {
+      const size_t bytesWritten = i2s_.write(reinterpret_cast<const uint8_t*>(pcmBytes + played), byteCount - played);
+      if (bytesWritten == 0) {
         return false;
       }
 
@@ -426,7 +400,21 @@ class I2SMicCapture {
       return false;
     }
     setAudioEnable(false);
-    return setClock(sampleRate_, I2S_CHANNEL_STEREO, I2S_BITS_PER_SAMPLE_16BIT);
+    return setClock(sampleRate_, I2S_SLOT_MODE_STEREO);
+  }
+
+  esp_err_t readForSr(void* out, size_t len, size_t* bytesRead, uint32_t timeoutMs) {
+    if (bytesRead) {
+      *bytesRead = 0;
+    }
+    if (!ready_ || !out || len == 0 || !bytesRead) {
+      return ESP_ERR_INVALID_ARG;
+    }
+    const uint32_t boundedTimeout = (timeoutMs == 0 || timeoutMs == UINT32_MAX) ? 100 : timeoutMs;
+    i2s_.setTimeout(boundedTimeout);
+    const size_t got = i2s_.readBytes(reinterpret_cast<char*>(out), len);
+    *bytesRead = got;
+    return got > 0 ? ESP_OK : ESP_FAIL;
   }
 
   static CaptureMetrics analyze(const int16_t* samples, size_t count) {
@@ -454,18 +442,8 @@ class I2SMicCapture {
   }
 
   uint32_t sampleRate() const { return sampleRate_; }
-  i2s_port_t port() const { return port_; }
 
  private:
-  static int16_t unpackI2SSample16(int32_t raw) {
-    const int16_t hi = static_cast<int16_t>((raw >> 16) & 0xFFFF);
-    const int16_t lo = static_cast<int16_t>(raw & 0xFFFF);
-
-    const int32_t absHi = hi < 0 ? -static_cast<int32_t>(hi) : static_cast<int32_t>(hi);
-    const int32_t absLo = lo < 0 ? -static_cast<int32_t>(lo) : static_cast<int32_t>(lo);
-    return absHi >= absLo ? hi : lo;
-  }
-
   void setAudioEnable(bool high) {
     digitalWrite(PIN_AUDIO_ENABLE, high ? HIGH : LOW);
     audioEnableHigh_ = high;
@@ -478,21 +456,14 @@ class I2SMicCapture {
     setAudioEnable(enableHigh);
     delay(20);
 
-    if (!setClock(sampleRate_, I2S_CHANNEL_STEREO, I2S_BITS_PER_SAMPLE_16BIT)) {
+    if (!setClock(sampleRate_, I2S_SLOT_MODE_STEREO)) {
       return 0.0f;
     }
 
     static const size_t kProbeFrames = 256;
     int16_t probe[kProbeFrames * 2] = {0};
-    size_t bytesRead = 0;
-    const esp_err_t err = i2s_read(
-        port_,
-        reinterpret_cast<void*>(probe),
-        sizeof(probe),
-        &bytesRead,
-        pdMS_TO_TICKS(250));
-
-    if (err != ESP_OK || bytesRead == 0) {
+    const size_t bytesRead = i2s_.readBytes(reinterpret_cast<char*>(probe), sizeof(probe));
+    if (bytesRead == 0) {
       return 0.0f;
     }
 
@@ -525,31 +496,30 @@ class I2SMicCapture {
         "% -> capture EN " + (captureEnableHigh_ ? "HIGH" : "LOW"));
   }
 
-  bool setClock(uint32_t sampleRate, i2s_channel_t channels, i2s_bits_per_sample_t bitsPerSample) {
+  bool setClock(uint32_t sampleRate, i2s_slot_mode_t slotMode) {
     if (!ready_) {
       return false;
     }
-    if (sampleRate == activeSampleRate_ &&
-        static_cast<int>(channels) == activeChannels_ &&
-        static_cast<int>(bitsPerSample) == activeBitsPerSample_) {
+    if (sampleRate == activeSampleRate_ && slotMode == activeSlotMode_) {
       return true;
     }
-    const esp_err_t err = i2s_set_clk(port_, sampleRate, bitsPerSample, channels);
-    if (err != ESP_OK) {
+    if (!i2s_.configureRX(sampleRate, I2S_DATA_BIT_WIDTH_16BIT, slotMode)) {
+      return false;
+    }
+    const int8_t slotMask = slotMode == I2S_SLOT_MODE_STEREO ? I2S_STD_SLOT_BOTH : I2S_STD_SLOT_LEFT;
+    if (!i2s_.configureTX(sampleRate, I2S_DATA_BIT_WIDTH_16BIT, slotMode, slotMask)) {
       return false;
     }
     activeSampleRate_ = sampleRate;
-    activeChannels_ = static_cast<int>(channels);
-    activeBitsPerSample_ = static_cast<int>(bitsPerSample);
+    activeSlotMode_ = slotMode;
     return true;
   }
 
+  I2SClass i2s_;
   bool ready_ = false;
-  i2s_port_t port_ = I2S_NUM_1;
   uint32_t sampleRate_ = 16000;
   uint32_t activeSampleRate_ = 0;
-  int activeChannels_ = -1;
-  int activeBitsPerSample_ = -1;
+  i2s_slot_mode_t activeSlotMode_ = I2S_SLOT_MODE_MONO;
   bool audioEnableHigh_ = false;
   bool captureEnableHigh_ = false;
 };

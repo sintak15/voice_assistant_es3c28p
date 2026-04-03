@@ -22,7 +22,10 @@
 #define TFT_MISO 13
 #define TFT_RST  -1
 
+// UI calls drawString(..., font=2/4), so these bitmap fonts must be enabled.
 #define LOAD_GLCD
+#define LOAD_FONT2
+#define LOAD_FONT4
 
 #define SPI_FREQUENCY       27000000
 #define SPI_READ_FREQUENCY  20000000

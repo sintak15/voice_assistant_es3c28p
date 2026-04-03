@@ -20,6 +20,8 @@
 #include "secrets.h"
 #endif
 
+#define ASSISTANT_HAS_LOCAL_SR 1
+
 enum class AssistantState {
   Booting,
   ConnectingWiFi,
@@ -36,6 +38,10 @@ static const uint16_t SCREEN_HEIGHT = 320;
 
 #ifndef ASSISTANT_CAPTURE_MAX_SECONDS
 #define ASSISTANT_CAPTURE_MAX_SECONDS 18
+#endif
+
+#ifndef ASSISTANT_HANDSFREE_CAPTURE_MAX_SECONDS
+#define ASSISTANT_HANDSFREE_CAPTURE_MAX_SECONDS 8
 #endif
 
 #ifndef ASSISTANT_VAD_START_RMS
@@ -62,6 +68,34 @@ static const uint16_t SCREEN_HEIGHT = 320;
 #define ASSISTANT_VAD_PREROLL_MS 260
 #endif
 
+#ifndef ASSISTANT_HANDSFREE_VAD_TRAILING_SILENCE_MS
+#define ASSISTANT_HANDSFREE_VAD_TRAILING_SILENCE_MS 520
+#endif
+
+#ifndef ASSISTANT_HANDSFREE_VAD_MAX_WAIT_MS
+#define ASSISTANT_HANDSFREE_VAD_MAX_WAIT_MS 1400
+#endif
+
+#ifndef ASSISTANT_HANDSFREE_VAD_MIN_SPEECH_MS
+#define ASSISTANT_HANDSFREE_VAD_MIN_SPEECH_MS 220
+#endif
+
+#ifndef ASSISTANT_HANDSFREE_VAD_PREROLL_MS
+#define ASSISTANT_HANDSFREE_VAD_PREROLL_MS 200
+#endif
+
+#ifndef ASSISTANT_BUSY_STATE_TIMEOUT_MS
+#define ASSISTANT_BUSY_STATE_TIMEOUT_MS 120000
+#endif
+
+#ifndef ASSISTANT_WATCHDOG_MAX_STRIKES
+#define ASSISTANT_WATCHDOG_MAX_STRIKES 3
+#endif
+
+#ifndef ASSISTANT_LOW_HEAP_THRESHOLD_BYTES
+#define ASSISTANT_LOW_HEAP_THRESHOLD_BYTES 12000
+#endif
+
 static const uint32_t CAPTURE_SAMPLE_RATE = 16000;
 static const uint16_t CAPTURE_SECONDS = 4;
 static const size_t CAPTURE_SAMPLES = CAPTURE_SAMPLE_RATE * CAPTURE_SECONDS;
@@ -76,6 +110,29 @@ static const uint32_t WIFI_POLL_INTERVAL_MS = 700;
 static const uint32_t WIFI_RETRY_BASE_MS = 2000;
 static const uint32_t WIFI_RETRY_MAX_MS = 60000;
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 12000;
+static const uint32_t LOCAL_WAKE_COOLDOWN_MS = 1800;
+static const uint32_t HANDSFREE_VAD_POLL_INTERVAL_MS = 120;
+static const uint32_t HANDSFREE_VAD_COOLDOWN_MS = 2600;
+static const uint32_t RUNTIME_HEALTH_POLL_MS = 1000;
+static const uint32_t WATCHDOG_STRIKE_WINDOW_MS = 8UL * 60UL * 1000UL;
+
+#if ASSISTANT_HAS_LOCAL_SR
+#include <esp32-hal-sr.h>
+enum : int {
+  SR_CMD_WAKE_BOB = 1,
+};
+static const sr_cmd_t kLocalWakeCommands[] = {
+    {SR_CMD_WAKE_BOB, "ok mister bob", "bKd MgSTk BnB"},
+    {SR_CMD_WAKE_BOB, "okay mister bob", "bKd MgSTk BnB"},
+};
+#endif
+
+enum class CaptureRequestSource : uint8_t {
+  Unknown = 0,
+  Boot = 1,
+  Vad = 2,
+  Wake = 3,
+};
 
 static TFT_eSPI tft = TFT_eSPI(SCREEN_WIDTH, SCREEN_HEIGHT);
 static Es8311Codec codec;
@@ -86,6 +143,20 @@ static String stateDetail = "Starting";
 
 static bool audioReady = false;
 static bool captureRequested = false;
+static CaptureRequestSource captureSource = CaptureRequestSource::Unknown;
+static bool handsFreeEnabled = false;
+static bool localWakeEnabled = false;
+static bool localWakeReady = false;
+static bool localWakePaused = false;
+static volatile bool localWakeTriggerPending = false;
+static volatile uint32_t localWakeTriggerAtMs = 0;
+static volatile int localWakePhraseId = -1;
+static uint8_t handsFreeVadActiveFrames = 0;
+static uint32_t handsFreeCooldownUntilMs = 0;
+static uint32_t handsFreeVadLastPollMs = 0;
+static uint32_t handsFreeArmAtMs = 0;
+static float handsFreeNoiseRms = 0.0f;
+static CaptureMetrics handsFreeLastLevel;
 
 static bool bootPressed = false;
 static uint32_t bootPressStartMs = 0;
@@ -118,6 +189,16 @@ static uint32_t lastCaptureMs = 0;
 static float lastCaptureRms = 0.0f;
 static float lastCapturePeak = 0.0f;
 static String haConversationId;
+static uint32_t stateEnteredAtMs = 0;
+static uint32_t lastHealthPollMs = 0;
+static uint32_t watchdogWindowStartMs = 0;
+static uint8_t watchdogStrikeCount = 0;
+static uint8_t lowHeapConsecutive = 0;
+static float listeningFrameRms = 0.0f;
+static float listeningFramePeak = 0.0f;
+static uint32_t listeningCapturedMs = 0;
+static bool listeningSpeechStarted = false;
+static uint32_t listeningUiLastRefreshMs = 0;
 
 String clipText(const String& text, size_t maxLen) {
   if (text.length() <= maxLen) {
@@ -205,7 +286,8 @@ const char* stateName(AssistantState s) {
 
 void drawScreen(bool force) {
   const uint32_t nowMs = millis();
-  if (!force && !uiDirty && (nowMs - lastUiDrawMs) < 350) {
+  const uint32_t minRefreshMs = state == AssistantState::Listening ? 90 : 350;
+  if (!force && !uiDirty && (nowMs - lastUiDrawMs) < minRefreshMs) {
     return;
   }
 
@@ -254,21 +336,92 @@ void drawScreen(bool force) {
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.drawString(clipText(lastReply.length() ? lastReply : "(none)", 62), 8, 186, 2);
 
-  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  tft.drawString("Press BOOT for capture", 8, 288, 2);
+  if (state == AssistantState::Listening) {
+    const uint16_t panelBg = tft.color565(34, 6, 6);
+    const uint16_t panelBorder = tft.color565(230, 70, 70);
+    const uint16_t meterBg = tft.color565(60, 60, 60);
+    const uint16_t pulseColor = ((nowMs / 180) % 2) == 0 ? TFT_ORANGE : TFT_RED;
 
-  if (lastCaptureSamples > 0) {
+    tft.fillRoundRect(8, 220, 224, 90, 10, panelBg);
+    tft.drawRoundRect(8, 220, 224, 90, 10, panelBorder);
+    tft.fillCircle(24, 238, 7, pulseColor);
+
+    tft.setTextColor(TFT_WHITE, panelBg);
+    tft.drawString("LISTENING", 38, 228, 4);
+    tft.setTextColor(TFT_LIGHTGREY, panelBg);
+    tft.drawString(listeningSpeechStarted ? "Speech detected" : "Waiting for speech", 14, 254, 2);
+
+    const int meterX = 14;
+    const int meterY = 274;
+    const int meterW = 196;
+    const int meterH = 10;
+    tft.fillRect(meterX, meterY, meterW, meterH, meterBg);
+    tft.drawRect(meterX, meterY, meterW, meterH, TFT_DARKGREY);
+
+    int rmsWidth = static_cast<int>(listeningFrameRms * 3800.0f);
+    if (rmsWidth < 0) {
+      rmsWidth = 0;
+    }
+    if (rmsWidth > (meterW - 2)) {
+      rmsWidth = meterW - 2;
+    }
+    if (rmsWidth > 0) {
+      tft.fillRect(meterX + 1, meterY + 1, rmsWidth, meterH - 2, TFT_CYAN);
+    }
+
+    int peakX = meterX + static_cast<int>(listeningFramePeak * (meterW - 2));
+    if (peakX < meterX + 1) {
+      peakX = meterX + 1;
+    }
+    if (peakX > meterX + meterW - 2) {
+      peakX = meterX + meterW - 2;
+    }
+    tft.drawFastVLine(peakX, meterY - 1, meterH + 2, TFT_YELLOW);
+
+    tft.setTextColor(TFT_WHITE, panelBg);
+    tft.drawString(String("Live: ") + String(listeningCapturedMs / 1000.0f, 1) + "s", 14, 289, 2);
+  } else {
     tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    const String capInfo =
-        String("Last cap ") + String(lastCaptureMs / 1000.0f, 2) +
-        "s pk " + String(lastCapturePeak * 100.0f, 1) + "%";
-    tft.drawString(clipText(capInfo, 42), 8, 270, 2);
+    tft.drawString("Press BOOT for capture", 8, 288, 2);
+
+    if (lastCaptureSamples > 0) {
+      tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+      const String capInfo =
+          String("Last cap ") + String(lastCaptureMs / 1000.0f, 2) +
+          "s pk " + String(lastCapturePeak * 100.0f, 1) + "%";
+      tft.drawString(clipText(capInfo, 42), 8, 270, 2);
+    }
   }
+}
+
+void listeningCaptureProgressCallback(
+    const CaptureMetrics& frameMetrics,
+    bool speechStarted,
+    size_t capturedSamples,
+    void* userData) {
+  (void)userData;
+
+  listeningFrameRms = frameMetrics.rmsNorm;
+  listeningFramePeak = frameMetrics.peakNorm;
+  listeningSpeechStarted = speechStarted;
+  listeningCapturedMs = static_cast<uint32_t>((capturedSamples * 1000ULL) / CAPTURE_SAMPLE_RATE);
+
+  const uint32_t nowMs = millis();
+  if ((nowMs - listeningUiLastRefreshMs) < 90) {
+    return;
+  }
+  listeningUiLastRefreshMs = nowMs;
+  uiDirty = true;
+  drawScreen(false);
 }
 
 void setState(AssistantState nextState, const String& detail) {
   state = nextState;
   stateDetail = detail;
+  stateEnteredAtMs = millis();
+  if (nextState != AssistantState::Listening) {
+    listeningUiLastRefreshMs = 0;
+  }
   uiDirty = true;
 
   Serial.print("State -> ");
@@ -1311,12 +1464,30 @@ void pollWifiConnection(uint32_t nowMs) {
   scheduleWifiReconnect(nowMs, false, "retry failed");
 }
 
-void requestCapture(const char* source) {
+const char* captureSourceName(CaptureRequestSource source) {
+  switch (source) {
+    case CaptureRequestSource::Boot:
+      return "BOOT";
+    case CaptureRequestSource::Vad:
+      return "VAD";
+    case CaptureRequestSource::Wake:
+      return "WAKE";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+void requestCapture(CaptureRequestSource source, const char* sourceLabel) {
   if (stateBusy()) {
     return;
   }
+  captureSource = source;
   captureRequested = true;
-  setState(AssistantState::Idle, String("Capture requested: ") + source);
+  setState(AssistantState::Idle, String("Capture requested: ") + sourceLabel);
+}
+
+void requestCapture(const char* sourceLabel) {
+  requestCapture(CaptureRequestSource::Unknown, sourceLabel);
 }
 
 void pollBootButton(uint32_t nowMs) {
@@ -1333,12 +1504,276 @@ void pollBootButton(uint32_t nowMs) {
     bootPressed = false;
 
     if (heldMs < 1200) {
-      requestCapture("BOOT");
+      requestCapture(CaptureRequestSource::Boot, "BOOT");
     }
   }
 }
 
-void runAssistantCycle() {
+#if ASSISTANT_HAS_LOCAL_SR
+esp_err_t localWakeFillCb(void* arg, void* out, size_t len, size_t* bytesRead, uint32_t timeoutMs) {
+  (void)arg;
+  if (bytesRead) {
+    *bytesRead = 0;
+  }
+  if (!out || len == 0 || !bytesRead) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if (!handsFreeEnabled || !localWakeReady || localWakePaused) {
+    vTaskDelay(pdMS_TO_TICKS(20));
+    return ESP_FAIL;
+  }
+  if (!audioReady || state != AssistantState::Idle || captureRequested) {
+    vTaskDelay(pdMS_TO_TICKS(12));
+    return ESP_FAIL;
+  }
+
+  const uint32_t effectiveTimeout = timeoutMs == 0 || timeoutMs == UINT32_MAX ? 80 : timeoutMs;
+  return micCapture.readForSr(out, len, bytesRead, effectiveTimeout);
+}
+
+void localWakeEventCb(void* arg, sr_event_t event, int commandId, int phraseId) {
+  (void)arg;
+  if (event != SR_EVENT_COMMAND || commandId != SR_CMD_WAKE_BOB) {
+    return;
+  }
+  localWakePhraseId = phraseId;
+  localWakeTriggerAtMs = millis();
+  localWakeTriggerPending = true;
+}
+#endif
+
+bool startLocalWakeEngine(String& outError) {
+  outError = "";
+  localWakeTriggerPending = false;
+  localWakePhraseId = -1;
+
+  if (!localWakeEnabled || !handsFreeEnabled) {
+    return false;
+  }
+
+#if !ASSISTANT_HAS_LOCAL_SR
+  outError = "ESP-SR unavailable";
+  return false;
+#else
+  if (!audioReady) {
+    outError = "audio not ready";
+    return false;
+  }
+  if (localWakeReady) {
+    return true;
+  }
+  if (!micCapture.prepareCaptureClock()) {
+    outError = "capture clock setup failed";
+    return false;
+  }
+
+  const esp_err_t err = sr_start(
+      localWakeFillCb,
+      nullptr,
+      SR_CHANNELS_STEREO,
+      SR_MODE_COMMAND,
+      "MM",
+      kLocalWakeCommands,
+      sizeof(kLocalWakeCommands) / sizeof(kLocalWakeCommands[0]),
+      localWakeEventCb,
+      nullptr);
+  if (err != ESP_OK) {
+    outError = String("sr_start failed: ") + err;
+    localWakeReady = false;
+    return false;
+  }
+
+  localWakePaused = false;
+  localWakeReady = true;
+  Serial.println("[WAKE] local wake detector ready");
+  return true;
+#endif
+}
+
+void stopLocalWakeEngine() {
+#if ASSISTANT_HAS_LOCAL_SR
+  if (localWakeReady) {
+    sr_stop();
+  }
+#endif
+  localWakeReady = false;
+  localWakePaused = false;
+  localWakeTriggerPending = false;
+  localWakePhraseId = -1;
+}
+
+bool pauseLocalWakeEngine() {
+#if ASSISTANT_HAS_LOCAL_SR
+  if (!localWakeReady || localWakePaused) {
+    return false;
+  }
+  if (sr_pause() == ESP_OK) {
+    localWakePaused = true;
+    return true;
+  }
+#endif
+  return false;
+}
+
+void resumeLocalWakeEngine() {
+#if ASSISTANT_HAS_LOCAL_SR
+  if (!localWakeReady || !localWakePaused) {
+    return;
+  }
+  if (!micCapture.prepareCaptureClock()) {
+    Serial.println("[WAKE] resume failed: capture clock");
+    return;
+  }
+  if (sr_resume() == ESP_OK) {
+    localWakePaused = false;
+    localWakeTriggerPending = false;
+  }
+#endif
+}
+
+void pollLocalWakeTrigger(uint32_t nowMs) {
+  if (!handsFreeEnabled || !localWakeEnabled || !localWakeReady) {
+    return;
+  }
+  if (!localWakeTriggerPending || captureRequested || state != AssistantState::Idle) {
+    return;
+  }
+  if (nowMs < handsFreeCooldownUntilMs) {
+    return;
+  }
+
+  localWakeTriggerPending = false;
+  handsFreeCooldownUntilMs = nowMs + LOCAL_WAKE_COOLDOWN_MS;
+  handsFreeVadActiveFrames = 0;
+  Serial.println(String("[WAKE] local trigger phrase=") + localWakePhraseId);
+  requestCapture(CaptureRequestSource::Wake, "WAKE");
+}
+
+void pollHandsFreeTrigger(uint32_t nowMs) {
+  if (!handsFreeEnabled || !audioReady || captureRequested || state != AssistantState::Idle) {
+    return;
+  }
+  if (nowMs < handsFreeArmAtMs) {
+    return;
+  }
+  if (nowMs < handsFreeCooldownUntilMs) {
+    return;
+  }
+
+  if (localWakeEnabled && localWakeReady) {
+#if ASSISTANT_LOCAL_WAKE_USE_VAD_FALLBACK
+    // Keep VAD active as a fallback if requested.
+#else
+    return;
+#endif
+  }
+
+  if ((nowMs - handsFreeVadLastPollMs) < HANDSFREE_VAD_POLL_INTERVAL_MS) {
+    return;
+  }
+  handsFreeVadLastPollMs = nowMs;
+
+  CaptureMetrics level;
+  if (!micCapture.probeLevel(level, 128)) {
+    handsFreeVadActiveFrames = 0;
+    return;
+  }
+  handsFreeLastLevel = level;
+
+  if (handsFreeNoiseRms <= 0.0f) {
+    handsFreeNoiseRms = level.rmsNorm;
+  } else {
+    handsFreeNoiseRms = (handsFreeNoiseRms * 0.96f) + (level.rmsNorm * 0.04f);
+  }
+
+  float rmsTrigger = ASSISTANT_VAD_TRIGGER_RMS > 0.001f ? ASSISTANT_VAD_TRIGGER_RMS : 0.001f;
+  const float adaptiveTrigger = handsFreeNoiseRms * 2.6f;
+  if (adaptiveTrigger > rmsTrigger) {
+    rmsTrigger = adaptiveTrigger;
+  }
+  const float peakTrigger = rmsTrigger * 2.8f;
+  const bool hot = level.rmsNorm >= rmsTrigger || level.peakNorm >= peakTrigger;
+  if (hot) {
+    if (handsFreeVadActiveFrames < 20) {
+      handsFreeVadActiveFrames++;
+    }
+  } else if (handsFreeVadActiveFrames > 0) {
+    handsFreeVadActiveFrames--;
+  }
+
+  const uint8_t neededFrames = ASSISTANT_VAD_TRIGGER_FRAMES > 0 ? ASSISTANT_VAD_TRIGGER_FRAMES : 1;
+  if (handsFreeVadActiveFrames >= neededFrames) {
+    handsFreeVadActiveFrames = 0;
+    handsFreeCooldownUntilMs = nowMs + HANDSFREE_VAD_COOLDOWN_MS;
+    Serial.println(
+        String("[VAD] hands-free trigger rms=") + String(level.rmsNorm, 4) +
+        " peak=" + String(level.peakNorm, 4));
+    requestCapture(CaptureRequestSource::Vad, "VAD");
+  }
+}
+
+void registerWatchdogStrike(const String& reason) {
+  const uint32_t nowMs = millis();
+  if (watchdogWindowStartMs == 0 || (nowMs - watchdogWindowStartMs) > WATCHDOG_STRIKE_WINDOW_MS) {
+    watchdogWindowStartMs = nowMs;
+    watchdogStrikeCount = 0;
+  }
+  watchdogStrikeCount++;
+  Serial.println(String("[WDT] strike ") + watchdogStrikeCount + "/" + ASSISTANT_WATCHDOG_MAX_STRIKES + " | " + reason);
+
+  if (watchdogStrikeCount >= ASSISTANT_WATCHDOG_MAX_STRIKES) {
+    Serial.println("[WDT] max strikes reached, restarting");
+    delay(80);
+    ESP.restart();
+  }
+}
+
+void softRecoverRuntime(const String& reason) {
+  registerWatchdogStrike(reason);
+  captureRequested = false;
+  captureSource = CaptureRequestSource::Unknown;
+  invalidateHaAuthProbeCache();
+  stopLocalWakeEngine();
+  if (localWakeEnabled) {
+    String wakeErr;
+    if (!startLocalWakeEngine(wakeErr)) {
+      Serial.println(String("[WAKE] restart failed: ") + wakeErr);
+      localWakeEnabled = false;
+    }
+  }
+  setState(AssistantState::Idle, String("Recovered: ") + clipText(reason, 28));
+}
+
+void pollRuntimeHealth(uint32_t nowMs) {
+  if ((nowMs - lastHealthPollMs) < RUNTIME_HEALTH_POLL_MS) {
+    return;
+  }
+  lastHealthPollMs = nowMs;
+
+  if (stateBusy()) {
+    const uint32_t busyMs = nowMs - stateEnteredAtMs;
+    if (busyMs > ASSISTANT_BUSY_STATE_TIMEOUT_MS) {
+      softRecoverRuntime(String("state timeout ") + stateName(state));
+      return;
+    }
+  }
+
+  const size_t internalFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  if (internalFree < ASSISTANT_LOW_HEAP_THRESHOLD_BYTES) {
+    if (lowHeapConsecutive < 10) {
+      lowHeapConsecutive++;
+    }
+  } else if (lowHeapConsecutive > 0) {
+    lowHeapConsecutive--;
+  }
+
+  if (lowHeapConsecutive >= 3) {
+    lowHeapConsecutive = 0;
+    softRecoverRuntime(String("low heap ") + internalFree);
+  }
+}
+
+void runAssistantCycle(CaptureRequestSource triggerSource) {
   if (!audioReady) {
     setState(AssistantState::Error, "Audio not initialized");
     return;
@@ -1361,12 +1796,34 @@ void runAssistantCycle() {
     return;
   }
 
+  struct LocalWakePauseGuard {
+    bool paused = false;
+    LocalWakePauseGuard() { paused = pauseLocalWakeEngine(); }
+    ~LocalWakePauseGuard() {
+      if (paused) {
+        resumeLocalWakeEngine();
+      }
+    }
+  } localWakePauseGuard;
+
+  const bool handsFreeTriggered =
+      triggerSource == CaptureRequestSource::Vad || triggerSource == CaptureRequestSource::Wake;
+
+  listeningFrameRms = 0.0f;
+  listeningFramePeak = 0.0f;
+  listeningCapturedMs = 0;
+  listeningSpeechStarted = false;
+  listeningUiLastRefreshMs = 0;
   setState(AssistantState::Listening, "Capturing audio");
   drawScreen(true);
 
   size_t captureMaxSamples = captureBufferCapacity;
+  size_t captureMaxSeconds = ASSISTANT_CAPTURE_MAX_SECONDS;
+  if (handsFreeTriggered && ASSISTANT_HANDSFREE_CAPTURE_MAX_SECONDS > 0) {
+    captureMaxSeconds = ASSISTANT_HANDSFREE_CAPTURE_MAX_SECONDS;
+  }
   const size_t configuredMaxSamples =
-      static_cast<size_t>(CAPTURE_SAMPLE_RATE) * static_cast<size_t>(ASSISTANT_CAPTURE_MAX_SECONDS);
+      static_cast<size_t>(CAPTURE_SAMPLE_RATE) * captureMaxSeconds;
   if (configuredMaxSamples > 0 && configuredMaxSamples < captureMaxSamples) {
     captureMaxSamples = configuredMaxSamples;
   }
@@ -1378,13 +1835,25 @@ void runAssistantCycle() {
   vad.startRmsNorm = ASSISTANT_VAD_START_RMS;
   vad.stopRmsNorm = ASSISTANT_VAD_STOP_RMS;
   vad.frameMs = 20;
-  vad.maxWaitMs = ASSISTANT_VAD_MAX_WAIT_MS;
-  vad.trailingSilenceMs = ASSISTANT_VAD_TRAILING_SILENCE_MS;
-  vad.minSpeechMs = ASSISTANT_VAD_MIN_SPEECH_MS;
-  vad.preRollMs = ASSISTANT_VAD_PREROLL_MS;
+  vad.maxWaitMs = handsFreeTriggered ? ASSISTANT_HANDSFREE_VAD_MAX_WAIT_MS : ASSISTANT_VAD_MAX_WAIT_MS;
+  vad.trailingSilenceMs = handsFreeTriggered ? ASSISTANT_HANDSFREE_VAD_TRAILING_SILENCE_MS : ASSISTANT_VAD_TRAILING_SILENCE_MS;
+  vad.minSpeechMs = handsFreeTriggered ? ASSISTANT_HANDSFREE_VAD_MIN_SPEECH_MS : ASSISTANT_VAD_MIN_SPEECH_MS;
+  vad.preRollMs = handsFreeTriggered ? ASSISTANT_HANDSFREE_VAD_PREROLL_MS : ASSISTANT_VAD_PREROLL_MS;
+
+  Serial.println(
+      String("[MIC] trigger=") + captureSourceName(triggerSource) +
+      " max_seconds=" + String(captureMaxSamples / static_cast<float>(CAPTURE_SAMPLE_RATE), 1) +
+      " vad_wait_ms=" + vad.maxWaitMs +
+      " vad_tail_ms=" + vad.trailingSilenceMs);
 
   CaptureResult captureResult;
-  if (!micCapture.captureVoiceCommand(captureBuffer, captureMaxSamples, vad, captureResult)) {
+  if (!micCapture.captureVoiceCommand(
+          captureBuffer,
+          captureMaxSamples,
+          vad,
+          captureResult,
+          listeningCaptureProgressCallback,
+          nullptr)) {
     setState(AssistantState::Error, "Microphone capture failed");
     return;
   }
@@ -1517,6 +1986,23 @@ void setup() {
       " psram=" + (captureBufferInPsram ? "yes" : "no"));
   logMemoryStats("post-buffer");
 
+  handsFreeEnabled = (ASSISTANT_ENABLE_HANDS_FREE != 0);
+  localWakeEnabled = handsFreeEnabled && (ASSISTANT_LOCAL_WAKE_ENABLED != 0);
+  handsFreeArmAtMs = millis() + 8000;
+  Serial.println(String("[WAKE] hands-free ") + (handsFreeEnabled ? "enabled" : "disabled"));
+  Serial.println(String("[WAKE] local detector ") + (localWakeEnabled ? "enabled" : "disabled"));
+#if ASSISTANT_HAS_LOCAL_SR
+  Serial.println("[WAKE] phrases: ok mister bob | okay mister bob");
+#endif
+  if (localWakeEnabled) {
+    String wakeErr;
+    if (!startLocalWakeEngine(wakeErr)) {
+      localWakeEnabled = false;
+      localWakeReady = false;
+      Serial.println(String("[WAKE] local disabled: ") + wakeErr);
+    }
+  }
+
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
@@ -1546,11 +2032,16 @@ void loop() {
   const uint32_t nowMs = millis();
 
   pollBootButton(nowMs);
+  pollLocalWakeTrigger(nowMs);
+  pollHandsFreeTrigger(nowMs);
   pollWifiConnection(nowMs);
+  pollRuntimeHealth(nowMs);
 
   if (captureRequested && (state == AssistantState::Idle || state == AssistantState::Error)) {
+    const CaptureRequestSource triggerSource = captureSource;
     captureRequested = false;
-    runAssistantCycle();
+    captureSource = CaptureRequestSource::Unknown;
+    runAssistantCycle(triggerSource);
   }
 
   drawScreen(false);

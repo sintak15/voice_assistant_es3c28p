@@ -41,7 +41,7 @@
 #endif
 
 #ifndef HA_WAKE_PHRASE
-#define HA_WAKE_PHRASE "ok bob,okay bob"
+#define HA_WAKE_PHRASE "ok mister bob,okay mister bob"
 #endif
 
 #ifndef ASSISTANT_ENABLE_HANDS_FREE
@@ -69,6 +69,10 @@
 #define ASSISTANT_CAPTURE_MAX_SECONDS 18
 #endif
 
+#ifndef ASSISTANT_HANDSFREE_CAPTURE_MAX_SECONDS
+#define ASSISTANT_HANDSFREE_CAPTURE_MAX_SECONDS 8
+#endif
+
 #ifndef ASSISTANT_VAD_START_RMS
 #define ASSISTANT_VAD_START_RMS 0.012f
 #endif
@@ -91,6 +95,33 @@
 
 #ifndef ASSISTANT_VAD_PREROLL_MS
 #define ASSISTANT_VAD_PREROLL_MS 260
+#endif
+
+// Hands-free can use tighter capture windows so it feels responsive and does not appear frozen.
+#ifndef ASSISTANT_HANDSFREE_VAD_TRAILING_SILENCE_MS
+#define ASSISTANT_HANDSFREE_VAD_TRAILING_SILENCE_MS 520
+#endif
+
+#ifndef ASSISTANT_HANDSFREE_VAD_MAX_WAIT_MS
+#define ASSISTANT_HANDSFREE_VAD_MAX_WAIT_MS 1400
+#endif
+
+#ifndef ASSISTANT_HANDSFREE_VAD_MIN_SPEECH_MS
+#define ASSISTANT_HANDSFREE_VAD_MIN_SPEECH_MS 220
+#endif
+
+#ifndef ASSISTANT_HANDSFREE_VAD_PREROLL_MS
+#define ASSISTANT_HANDSFREE_VAD_PREROLL_MS 200
+#endif
+
+// Runtime stability guard: if a busy state exceeds this window, firmware will soft-recover.
+#ifndef ASSISTANT_BUSY_STATE_TIMEOUT_MS
+#define ASSISTANT_BUSY_STATE_TIMEOUT_MS 120000
+#endif
+
+// Internal heap watchdog floor. Lower values avoid false positives when ESP-SR models are loaded.
+#ifndef ASSISTANT_LOW_HEAP_THRESHOLD_BYTES
+#define ASSISTANT_LOW_HEAP_THRESHOLD_BYTES 12000
 #endif
 
 // Cloud dashboard integration (Google Calendar/Tasks or any compatible JSON endpoint)

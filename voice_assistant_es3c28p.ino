@@ -96,6 +96,10 @@ static const uint16_t SCREEN_HEIGHT = 320;
 #define ASSISTANT_LOW_HEAP_THRESHOLD_BYTES 12000
 #endif
 
+#ifndef ASSISTANT_STT_UPLOAD_MAX_SECONDS
+#define ASSISTANT_STT_UPLOAD_MAX_SECONDS 4
+#endif
+
 static const uint32_t CAPTURE_SAMPLE_RATE = 16000;
 static const uint16_t CAPTURE_SECONDS = 4;
 static const size_t CAPTURE_SAMPLES = CAPTURE_SAMPLE_RATE * CAPTURE_SECONDS;
@@ -104,7 +108,7 @@ static const float CAPTURE_MIN_PEAK = 0.030f;
 
 static const uint16_t STT_CONNECT_TIMEOUT_MS = 7000;
 static const uint16_t STT_IO_TIMEOUT_MS = 14000;
-static const uint8_t STT_MAX_RETRIES = 2;
+static const uint8_t STT_MAX_RETRIES = 1;
 
 static const uint32_t WIFI_POLL_INTERVAL_MS = 700;
 static const uint32_t WIFI_RETRY_BASE_MS = 2000;
@@ -135,6 +139,8 @@ enum class CaptureRequestSource : uint8_t {
 };
 
 static TFT_eSPI tft = TFT_eSPI(SCREEN_WIDTH, SCREEN_HEIGHT);
+static TFT_eSprite uiSprite = TFT_eSprite(&tft);
+static bool uiSpriteReady = false;
 static Es8311Codec codec;
 static I2SMicCapture micCapture;
 
@@ -208,6 +214,16 @@ String clipText(const String& text, size_t maxLen) {
     return text.substring(0, maxLen);
   }
   return text.substring(0, maxLen - 3) + "...";
+}
+
+String tailText(const String& text, size_t maxLen) {
+  if (text.length() <= maxLen) {
+    return text;
+  }
+  if (maxLen < 4) {
+    return text.substring(text.length() - maxLen);
+  }
+  return "..." + text.substring(text.length() - (maxLen - 3));
 }
 
 void logMemoryStats(const char* phase) {
@@ -284,6 +300,113 @@ const char* stateName(AssistantState s) {
   return "Unknown";
 }
 
+template <typename DisplayT>
+void renderUiFrame(DisplayT& display, uint32_t nowMs) {
+  display.fillScreen(TFT_BLACK);
+  display.setTextDatum(TL_DATUM);
+
+  display.setTextColor(TFT_CYAN, TFT_BLACK);
+  display.drawString("HA Voice Core", 8, 8, 2);
+
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  display.drawString(String("State: ") + stateName(state), 8, 34, 2);
+
+  if (state == AssistantState::Error) {
+    static const size_t kErrorCharsPerLine = 58;
+    display.setTextColor(TFT_RED, TFT_BLACK);
+    display.drawString(clipText(stateDetail, kErrorCharsPerLine), 8, 52, 1);
+    if (stateDetail.length() > kErrorCharsPerLine) {
+      display.drawString(tailText(stateDetail, kErrorCharsPerLine), 8, 62, 1);
+    }
+  } else {
+    display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    display.drawString(clipText(stateDetail, 46), 8, 52, 2);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    display.setTextColor(TFT_GREEN, TFT_BLACK);
+    display.drawString(clipText(String("Wi-Fi: ") + WiFi.SSID() + " " + String(WiFi.RSSI()) + " dBm", 50), 8, 74, 2);
+  } else {
+    display.setTextColor(TFT_ORANGE, TFT_BLACK);
+    if (wifiReconnectPending) {
+      int32_t waitMs = static_cast<int32_t>(wifiNextRetryAtMs - nowMs);
+      if (waitMs < 0) {
+        waitMs = 0;
+      }
+      display.drawString(String("Wi-Fi retry in ") + String((waitMs + 999) / 1000) + "s", 8, 74, 2);
+    } else {
+      display.drawString("Wi-Fi disconnected", 8, 74, 2);
+    }
+  }
+
+  display.setTextColor(TFT_YELLOW, TFT_BLACK);
+  display.drawString("Transcript", 8, 108, 2);
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  display.drawString(clipText(lastTranscript.length() ? lastTranscript : "(none)", 62), 8, 126, 2);
+
+  display.setTextColor(TFT_YELLOW, TFT_BLACK);
+  display.drawString("Reply", 8, 168, 2);
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  display.drawString(clipText(lastReply.length() ? lastReply : "(none)", 62), 8, 186, 2);
+
+  if (state == AssistantState::Listening) {
+    const uint16_t panelBg = display.color565(34, 6, 6);
+    const uint16_t panelBorder = display.color565(230, 70, 70);
+    const uint16_t meterBg = display.color565(60, 60, 60);
+    const uint16_t pulseColor = ((nowMs / 180) % 2) == 0 ? TFT_ORANGE : TFT_RED;
+
+    display.fillRoundRect(8, 220, 224, 90, 10, panelBg);
+    display.drawRoundRect(8, 220, 224, 90, 10, panelBorder);
+    display.fillCircle(24, 238, 7, pulseColor);
+
+    display.setTextColor(TFT_WHITE, panelBg);
+    display.drawString("LISTENING", 38, 228, 4);
+    display.setTextColor(TFT_LIGHTGREY, panelBg);
+    display.drawString(listeningSpeechStarted ? "Speech detected" : "Waiting for speech", 14, 254, 2);
+
+    const int meterX = 14;
+    const int meterY = 274;
+    const int meterW = 196;
+    const int meterH = 10;
+    display.fillRect(meterX, meterY, meterW, meterH, meterBg);
+    display.drawRect(meterX, meterY, meterW, meterH, TFT_DARKGREY);
+
+    int rmsWidth = static_cast<int>(listeningFrameRms * 3800.0f);
+    if (rmsWidth < 0) {
+      rmsWidth = 0;
+    }
+    if (rmsWidth > (meterW - 2)) {
+      rmsWidth = meterW - 2;
+    }
+    if (rmsWidth > 0) {
+      display.fillRect(meterX + 1, meterY + 1, rmsWidth, meterH - 2, TFT_CYAN);
+    }
+
+    int peakX = meterX + static_cast<int>(listeningFramePeak * (meterW - 2));
+    if (peakX < meterX + 1) {
+      peakX = meterX + 1;
+    }
+    if (peakX > meterX + meterW - 2) {
+      peakX = meterX + meterW - 2;
+    }
+    display.drawFastVLine(peakX, meterY - 1, meterH + 2, TFT_YELLOW);
+
+    display.setTextColor(TFT_WHITE, panelBg);
+    display.drawString(String("Live: ") + String(listeningCapturedMs / 1000.0f, 1) + "s", 14, 289, 2);
+  } else {
+    display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    display.drawString("Press BOOT for capture", 8, 288, 2);
+
+    if (lastCaptureSamples > 0) {
+      display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+      const String capInfo =
+          String("Last cap ") + String(lastCaptureMs / 1000.0f, 2) +
+          "s pk " + String(lastCapturePeak * 100.0f, 1) + "%";
+      display.drawString(clipText(capInfo, 42), 8, 270, 2);
+    }
+  }
+}
+
 void drawScreen(bool force) {
   const uint32_t nowMs = millis();
   const uint32_t minRefreshMs = state == AssistantState::Listening ? 90 : 350;
@@ -294,103 +417,11 @@ void drawScreen(bool force) {
   uiDirty = false;
   lastUiDrawMs = nowMs;
 
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextDatum(TL_DATUM);
-
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.drawString("HA Voice Core", 8, 8, 2);
-
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString(String("State: ") + stateName(state), 8, 34, 2);
-
-  uint16_t detailColor = TFT_LIGHTGREY;
-  if (state == AssistantState::Error) {
-    detailColor = TFT_RED;
-  }
-  tft.setTextColor(detailColor, TFT_BLACK);
-  tft.drawString(clipText(stateDetail, 46), 8, 52, 2);
-
-  if (WiFi.status() == WL_CONNECTED) {
-    tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.drawString(clipText(String("Wi-Fi: ") + WiFi.SSID() + " " + String(WiFi.RSSI()) + " dBm", 50), 8, 74, 2);
+  if (uiSpriteReady) {
+    renderUiFrame(uiSprite, nowMs);
+    uiSprite.pushSprite(0, 0);
   } else {
-    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-    if (wifiReconnectPending) {
-      int32_t waitMs = static_cast<int32_t>(wifiNextRetryAtMs - nowMs);
-      if (waitMs < 0) {
-        waitMs = 0;
-      }
-      tft.drawString(String("Wi-Fi retry in ") + String((waitMs + 999) / 1000) + "s", 8, 74, 2);
-    } else {
-      tft.drawString("Wi-Fi disconnected", 8, 74, 2);
-    }
-  }
-
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.drawString("Transcript", 8, 108, 2);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString(clipText(lastTranscript.length() ? lastTranscript : "(none)", 62), 8, 126, 2);
-
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.drawString("Reply", 8, 168, 2);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString(clipText(lastReply.length() ? lastReply : "(none)", 62), 8, 186, 2);
-
-  if (state == AssistantState::Listening) {
-    const uint16_t panelBg = tft.color565(34, 6, 6);
-    const uint16_t panelBorder = tft.color565(230, 70, 70);
-    const uint16_t meterBg = tft.color565(60, 60, 60);
-    const uint16_t pulseColor = ((nowMs / 180) % 2) == 0 ? TFT_ORANGE : TFT_RED;
-
-    tft.fillRoundRect(8, 220, 224, 90, 10, panelBg);
-    tft.drawRoundRect(8, 220, 224, 90, 10, panelBorder);
-    tft.fillCircle(24, 238, 7, pulseColor);
-
-    tft.setTextColor(TFT_WHITE, panelBg);
-    tft.drawString("LISTENING", 38, 228, 4);
-    tft.setTextColor(TFT_LIGHTGREY, panelBg);
-    tft.drawString(listeningSpeechStarted ? "Speech detected" : "Waiting for speech", 14, 254, 2);
-
-    const int meterX = 14;
-    const int meterY = 274;
-    const int meterW = 196;
-    const int meterH = 10;
-    tft.fillRect(meterX, meterY, meterW, meterH, meterBg);
-    tft.drawRect(meterX, meterY, meterW, meterH, TFT_DARKGREY);
-
-    int rmsWidth = static_cast<int>(listeningFrameRms * 3800.0f);
-    if (rmsWidth < 0) {
-      rmsWidth = 0;
-    }
-    if (rmsWidth > (meterW - 2)) {
-      rmsWidth = meterW - 2;
-    }
-    if (rmsWidth > 0) {
-      tft.fillRect(meterX + 1, meterY + 1, rmsWidth, meterH - 2, TFT_CYAN);
-    }
-
-    int peakX = meterX + static_cast<int>(listeningFramePeak * (meterW - 2));
-    if (peakX < meterX + 1) {
-      peakX = meterX + 1;
-    }
-    if (peakX > meterX + meterW - 2) {
-      peakX = meterX + meterW - 2;
-    }
-    tft.drawFastVLine(peakX, meterY - 1, meterH + 2, TFT_YELLOW);
-
-    tft.setTextColor(TFT_WHITE, panelBg);
-    tft.drawString(String("Live: ") + String(listeningCapturedMs / 1000.0f, 1) + "s", 14, 289, 2);
-  } else {
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    tft.drawString("Press BOOT for capture", 8, 288, 2);
-
-    if (lastCaptureSamples > 0) {
-      tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-      const String capInfo =
-          String("Last cap ") + String(lastCaptureMs / 1000.0f, 2) +
-          "s pk " + String(lastCapturePeak * 100.0f, 1) + "%";
-      tft.drawString(clipText(capInfo, 42), 8, 270, 2);
-    }
+    renderUiFrame(tft, nowMs);
   }
 }
 
@@ -478,13 +509,372 @@ String ttsLanguageTag(const String& language) {
   return out;
 }
 
-bool beginHttp(HTTPClient& http, WiFiClientSecure& secureClient, const String& url) {
+bool beginHttp(HTTPClient& http, WiFiClient& plainClient, WiFiClientSecure& secureClient, const String& url) {
   if (url.startsWith("https://")) {
     secureClient.setInsecure();
     secureClient.setTimeout(STT_IO_TIMEOUT_MS);
     return http.begin(secureClient, url);
   }
-  return http.begin(url);
+  plainClient.setTimeout(STT_IO_TIMEOUT_MS);
+  return http.begin(plainClient, url);
+}
+
+bool parseHttpUrl(
+    const String& url,
+    String& outHost,
+    uint16_t& outPort,
+    String& outPath,
+    bool& outSecure) {
+  outHost = "";
+  outPort = 80;
+  outPath = "/";
+  outSecure = false;
+  int prefixLen = 0;
+  if (url.startsWith("http://")) {
+    outSecure = false;
+    outPort = 80;
+    prefixLen = 7;
+  } else if (url.startsWith("https://")) {
+    outSecure = true;
+    outPort = 443;
+    prefixLen = 8;
+  } else {
+    return false;
+  }
+
+  const int slash = url.indexOf('/', prefixLen);
+  String hostPort;
+  if (slash < 0) {
+    hostPort = url.substring(prefixLen);
+    outPath = "/";
+  } else {
+    hostPort = url.substring(prefixLen, slash);
+    outPath = url.substring(slash);
+  }
+
+  if (hostPort.length() == 0) {
+    return false;
+  }
+
+  const int colon = hostPort.lastIndexOf(':');
+  if (colon > 0 && hostPort.indexOf(']') < 0) {
+    outHost = hostPort.substring(0, colon);
+    const int parsedPort = hostPort.substring(colon + 1).toInt();
+    if (parsedPort <= 0 || parsedPort > 65535) {
+      return false;
+    }
+    outPort = static_cast<uint16_t>(parsedPort);
+  } else {
+    outHost = hostPort;
+  }
+
+  return outHost.length() > 0;
+}
+
+bool readHttpResponseBody(
+    WiFiClient& client,
+    int contentLength,
+    String& outBody,
+    String& outError) {
+  outBody = "";
+  outError = "";
+
+  uint32_t lastProgressMs = millis();
+  if (contentLength > 0) {
+    outBody.reserve(contentLength < 1024 ? contentLength : 1024);
+  }
+
+  while (true) {
+    while (client.available()) {
+      const int c = client.read();
+      if (c >= 0) {
+        outBody += static_cast<char>(c);
+      }
+      lastProgressMs = millis();
+      if (contentLength >= 0 && static_cast<int>(outBody.length()) >= contentLength) {
+        return true;
+      }
+    }
+
+    if (!client.connected()) {
+      return true;
+    }
+
+    if ((millis() - lastProgressMs) > STT_IO_TIMEOUT_MS) {
+      outError = "HTTP response read timeout";
+      return false;
+    }
+    delay(1);
+  }
+}
+
+bool postSttOverRawHttp(
+    const String& endpoint,
+    const String& authHeader,
+    const String& speechHeader,
+    const uint8_t* payload,
+    size_t payloadBytes,
+    int& outCode,
+    String& outBody,
+    String& outError) {
+  outCode = 0;
+  outBody = "";
+  outError = "";
+
+  String host;
+  uint16_t port = 80;
+  String path;
+  bool secure = false;
+  if (!parseHttpUrl(endpoint, host, port, path, secure)) {
+    outCode = HTTPC_ERROR_NOT_CONNECTED;
+    outError = "STT URL parse failed";
+    return false;
+  }
+  if (secure) {
+    outCode = HTTPC_ERROR_NOT_CONNECTED;
+    outError = "raw HTTP path only";
+    return false;
+  }
+
+  WiFiClient client;
+  client.setTimeout(STT_IO_TIMEOUT_MS);
+  if (!client.connect(host.c_str(), port)) {
+    outCode = HTTPC_ERROR_CONNECTION_REFUSED;
+    outError = "STT connect failed";
+    return false;
+  }
+
+  String request =
+      String("POST ") + path + " HTTP/1.1\r\n" +
+      "Host: " + host + ":" + String(port) + "\r\n" +
+      "Authorization: " + authHeader + "\r\n" +
+      "Content-Type: audio/wav\r\n" +
+      "X-Speech-Content: " + speechHeader + "\r\n" +
+      "Content-Length: " + String(payloadBytes) + "\r\n" +
+      "Connection: close\r\n\r\n";
+
+  const size_t headerWritten = client.print(request);
+  if (headerWritten != request.length()) {
+    client.stop();
+    outCode = HTTPC_ERROR_SEND_HEADER_FAILED;
+    outError = "STT send header failed";
+    return false;
+  }
+
+  size_t sent = 0;
+  uint32_t lastProgressMs = millis();
+  while (sent < payloadBytes) {
+    const size_t remaining = payloadBytes - sent;
+    const size_t chunk = remaining > 1024 ? 1024 : remaining;
+    const size_t written = client.write(payload + sent, chunk);
+    if (written > 0) {
+      sent += written;
+      lastProgressMs = millis();
+      continue;
+    }
+    if (!client.connected()) {
+      client.stop();
+      outCode = HTTPC_ERROR_CONNECTION_LOST;
+      outError = "STT connection lost while sending";
+      return false;
+    }
+    if ((millis() - lastProgressMs) > STT_IO_TIMEOUT_MS) {
+      client.stop();
+      outCode = HTTPC_ERROR_SEND_PAYLOAD_FAILED;
+      outError = "STT send payload timeout";
+      return false;
+    }
+    delay(1);
+  }
+
+  String statusLine = client.readStringUntil('\n');
+  statusLine.trim();
+  if (!statusLine.startsWith("HTTP/")) {
+    client.stop();
+    outCode = HTTPC_ERROR_READ_TIMEOUT;
+    outError = "STT bad HTTP status";
+    return false;
+  }
+
+  int firstSpace = statusLine.indexOf(' ');
+  int secondSpace = firstSpace >= 0 ? statusLine.indexOf(' ', firstSpace + 1) : -1;
+  if (firstSpace < 0) {
+    client.stop();
+    outCode = HTTPC_ERROR_READ_TIMEOUT;
+    outError = "STT status parse failed";
+    return false;
+  }
+  const String codeText = secondSpace > firstSpace
+                              ? statusLine.substring(firstSpace + 1, secondSpace)
+                              : statusLine.substring(firstSpace + 1);
+  outCode = codeText.toInt();
+
+  int contentLength = -1;
+  while (true) {
+    String headerLine = client.readStringUntil('\n');
+    headerLine.trim();
+    if (headerLine.length() == 0) {
+      break;
+    }
+    const int colon = headerLine.indexOf(':');
+    if (colon <= 0) {
+      continue;
+    }
+    String name = headerLine.substring(0, colon);
+    String value = headerLine.substring(colon + 1);
+    name.trim();
+    value.trim();
+    name.toLowerCase();
+    if (name == "content-length") {
+      contentLength = value.toInt();
+    }
+  }
+
+  if (!readHttpResponseBody(client, contentLength, outBody, outError)) {
+    client.stop();
+    if (outCode == 0) {
+      outCode = HTTPC_ERROR_READ_TIMEOUT;
+    }
+    return false;
+  }
+
+  client.stop();
+  return true;
+}
+
+bool postJsonOverRawHttp(
+    const String& endpoint,
+    const String& authHeader,
+    const String& jsonBody,
+    int& outCode,
+    String& outBody,
+    String& outError) {
+  outCode = 0;
+  outBody = "";
+  outError = "";
+
+  String host;
+  uint16_t port = 80;
+  String path;
+  bool secure = false;
+  if (!parseHttpUrl(endpoint, host, port, path, secure)) {
+    outCode = HTTPC_ERROR_NOT_CONNECTED;
+    outError = "JSON URL parse failed";
+    return false;
+  }
+  if (secure) {
+    outCode = HTTPC_ERROR_NOT_CONNECTED;
+    outError = "raw HTTP path only";
+    return false;
+  }
+
+  WiFiClient client;
+  client.setTimeout(STT_IO_TIMEOUT_MS);
+  if (!client.connect(host.c_str(), port)) {
+    outCode = HTTPC_ERROR_CONNECTION_REFUSED;
+    outError = "JSON connect failed";
+    return false;
+  }
+
+  const size_t payloadBytes = jsonBody.length();
+  String request =
+      String("POST ") + path + " HTTP/1.1\r\n" +
+      "Host: " + host + ":" + String(port) + "\r\n" +
+      "Authorization: " + authHeader + "\r\n" +
+      "Content-Type: application/json\r\n" +
+      "Accept: application/json\r\n" +
+      "Content-Length: " + String(payloadBytes) + "\r\n" +
+      "Connection: close\r\n\r\n";
+
+  const size_t headerWritten = client.print(request);
+  if (headerWritten != request.length()) {
+    client.stop();
+    outCode = HTTPC_ERROR_SEND_HEADER_FAILED;
+    outError = "JSON send header failed";
+    return false;
+  }
+
+  size_t sent = 0;
+  uint32_t lastProgressMs = millis();
+  while (sent < payloadBytes) {
+    const size_t remaining = payloadBytes - sent;
+    const size_t chunk = remaining > 1024 ? 1024 : remaining;
+    const size_t written = client.write(
+        reinterpret_cast<const uint8_t*>(jsonBody.c_str()) + sent,
+        chunk);
+    if (written > 0) {
+      sent += written;
+      lastProgressMs = millis();
+      continue;
+    }
+    if (!client.connected()) {
+      client.stop();
+      outCode = HTTPC_ERROR_CONNECTION_LOST;
+      outError = "JSON connection lost while sending";
+      return false;
+    }
+    if ((millis() - lastProgressMs) > STT_IO_TIMEOUT_MS) {
+      client.stop();
+      outCode = HTTPC_ERROR_SEND_PAYLOAD_FAILED;
+      outError = "JSON send payload timeout";
+      return false;
+    }
+    delay(1);
+  }
+
+  String statusLine = client.readStringUntil('\n');
+  statusLine.trim();
+  if (!statusLine.startsWith("HTTP/")) {
+    client.stop();
+    outCode = HTTPC_ERROR_READ_TIMEOUT;
+    outError = "JSON bad HTTP status";
+    return false;
+  }
+
+  const int firstSpace = statusLine.indexOf(' ');
+  const int secondSpace = firstSpace >= 0 ? statusLine.indexOf(' ', firstSpace + 1) : -1;
+  if (firstSpace < 0) {
+    client.stop();
+    outCode = HTTPC_ERROR_READ_TIMEOUT;
+    outError = "JSON status parse failed";
+    return false;
+  }
+  const String codeText = secondSpace > firstSpace
+                              ? statusLine.substring(firstSpace + 1, secondSpace)
+                              : statusLine.substring(firstSpace + 1);
+  outCode = codeText.toInt();
+
+  int contentLength = -1;
+  while (true) {
+    String headerLine = client.readStringUntil('\n');
+    headerLine.trim();
+    if (headerLine.length() == 0) {
+      break;
+    }
+    const int colon = headerLine.indexOf(':');
+    if (colon <= 0) {
+      continue;
+    }
+    String name = headerLine.substring(0, colon);
+    String value = headerLine.substring(colon + 1);
+    name.trim();
+    value.trim();
+    name.toLowerCase();
+    if (name == "content-length") {
+      contentLength = value.toInt();
+    }
+  }
+
+  if (!readHttpResponseBody(client, contentLength, outBody, outError)) {
+    client.stop();
+    if (outCode == 0) {
+      outCode = HTTPC_ERROR_READ_TIMEOUT;
+    }
+    return false;
+  }
+
+  client.stop();
+  return true;
 }
 
 void writeWavHeader(uint8_t* header, size_t dataBytes, uint32_t sampleRate) {
@@ -889,8 +1279,9 @@ bool homeAssistantAuthProbe(String& outError) {
 
   const String endpoint = joinedUrl(baseUrl.c_str(), "/api/");
   HTTPClient http;
+  WiFiClient plainClient;
   WiFiClientSecure secureClient;
-  if (!beginHttp(http, secureClient, endpoint)) {
+  if (!beginHttp(http, plainClient, secureClient, endpoint)) {
     outError = "Auth probe begin failed";
     return false;
   }
@@ -966,6 +1357,9 @@ bool homeAssistantStt(const int16_t* samples, size_t sampleCount, String& outTex
   const auto tryLanguage = [&](const String& language, String& languageError) -> bool {
     const String speechHeader = String("language=") + language +
                                 ";format=wav;codec=pcm;bit_rate=16;sample_rate=16000;channel=1";
+    const size_t shortSampleLimit = static_cast<size_t>(CAPTURE_SAMPLE_RATE) * 4;
+    size_t sendSampleCount = sampleCount;
+    bool shortenedPayloadTried = false;
 
     for (uint8_t retry = 0; retry <= STT_MAX_RETRIES; ++retry) {
       if (WiFi.status() != WL_CONNECTED) {
@@ -973,25 +1367,70 @@ bool homeAssistantStt(const int16_t* samples, size_t sampleCount, String& outTex
         return false;
       }
 
-      HTTPClient http;
-      WiFiClientSecure secureClient;
-      if (!beginHttp(http, secureClient, endpoint)) {
-        languageError = "HTTP begin failed";
+      const size_t wavDataBytes = sendSampleCount * sizeof(int16_t);
+      const size_t wavTotalBytes = 44 + wavDataBytes;
+      uint8_t* wavPayload = nullptr;
+#if defined(ESP32)
+      if (psramFound()) {
+        wavPayload = static_cast<uint8_t*>(ps_malloc(wavTotalBytes));
+      }
+#endif
+      if (!wavPayload) {
+        wavPayload = static_cast<uint8_t*>(malloc(wavTotalBytes));
+      }
+      if (!wavPayload) {
+        languageError = String("STT payload alloc failed: ") + wavTotalBytes + " bytes";
         return false;
       }
 
-      http.setReuse(false);
-      http.useHTTP10(true);
-      http.setConnectTimeout(STT_CONNECT_TIMEOUT_MS);
-      http.setTimeout(STT_IO_TIMEOUT_MS);
-      http.addHeader("Authorization", authHeader);
-      http.addHeader("Content-Type", "audio/wav");
-      http.addHeader("X-Speech-Content", speechHeader);
+      writeWavHeader(wavPayload, wavDataBytes, CAPTURE_SAMPLE_RATE);
+      memcpy(wavPayload + 44, samples, wavDataBytes);
+      int code = 0;
+      String response;
+      bool requestOk = false;
 
-      WavUploadStream wav(samples, sampleCount, CAPTURE_SAMPLE_RATE);
-      const int code = http.sendRequest("POST", &wav, wav.totalSize());
-      const String response = (code >= 200 && code <= 599) ? http.getString() : "";
-      http.end();
+      if (endpoint.startsWith("http://")) {
+        String rawError;
+        requestOk = postSttOverRawHttp(
+            endpoint,
+            authHeader,
+            speechHeader,
+            wavPayload,
+            wavTotalBytes,
+            code,
+            response,
+            rawError);
+        if (!requestOk && rawError.length() > 0) {
+          Serial.println(String("[STT] raw-http error: ") + rawError);
+        }
+      } else {
+        HTTPClient http;
+        WiFiClient plainClient;
+        WiFiClientSecure secureClient;
+        if (!beginHttp(http, plainClient, secureClient, endpoint)) {
+          free(wavPayload);
+          languageError = "HTTP begin failed";
+          return false;
+        }
+
+        http.setReuse(false);
+        http.useHTTP10(true);
+        http.setConnectTimeout(STT_CONNECT_TIMEOUT_MS);
+        http.setTimeout(STT_IO_TIMEOUT_MS);
+        http.addHeader("Authorization", authHeader);
+        http.addHeader("Content-Type", "audio/wav");
+        http.addHeader("X-Speech-Content", speechHeader);
+
+        code = http.sendRequest("POST", wavPayload, wavTotalBytes);
+        response = (code >= 200 && code <= 599) ? http.getString() : "";
+        requestOk = true;
+        http.end();
+      }
+
+      free(wavPayload);
+      if (!requestOk && code == 0) {
+        code = HTTPC_ERROR_NOT_CONNECTED;
+      }
 
       if (code >= 200 && code <= 299) {
         DynamicJsonDocument doc(2048);
@@ -1023,7 +1462,29 @@ bool homeAssistantStt(const int16_t* samples, size_t sampleCount, String& outTex
         invalidateHaAuthProbeCache();
       }
 
-      if (isRetryableSttTransportError(code) && retry < STT_MAX_RETRIES) {
+      Serial.println(
+          String("[STT] lang=") + language +
+          " retry=" + retry +
+          " payload_bytes=" + wavTotalBytes +
+          " code=" + code +
+          " err=" + languageError);
+
+      const bool retryableTransport = isRetryableSttTransportError(code);
+      const bool retryableServer = (code >= 500 && code <= 599);
+
+      if ((retryableTransport || retryableServer) &&
+          !shortenedPayloadTried &&
+          sendSampleCount > shortSampleLimit) {
+        shortenedPayloadTried = true;
+        sendSampleCount = shortSampleLimit;
+        Serial.println(
+            String("[STT] retry with short payload samples=") + sendSampleCount +
+            " seconds=" + String(sendSampleCount / static_cast<float>(CAPTURE_SAMPLE_RATE), 1));
+        delay(120);
+        continue;
+      }
+
+      if ((retryableTransport || retryableServer) && retry < STT_MAX_RETRIES) {
         delay(200 + retry * 200);
         continue;
       }
@@ -1033,25 +1494,33 @@ bool homeAssistantStt(const int16_t* samples, size_t sampleCount, String& outTex
     return false;
   };
 
-  if (tryLanguage(String(HA_LANGUAGE), outError)) {
+  String preferredLanguage = baseLanguageTag(String(HA_LANGUAGE));
+  preferredLanguage.trim();
+  if (preferredLanguage.length() == 0) {
+    preferredLanguage = String(HA_LANGUAGE);
+    preferredLanguage.trim();
+  }
+  String preferredError;
+  if (tryLanguage(preferredLanguage, preferredError)) {
     return true;
   }
 
-  if (!outError.startsWith("STT HTTP 415")) {
-    return false;
-  }
-
-  const String fallback = baseLanguageTag(String(HA_LANGUAGE));
-  if (fallback.length() == 0 || fallback == String(HA_LANGUAGE)) {
+  const String fallback = baseLanguageTag(preferredLanguage);
+  if (fallback.length() == 0 || fallback == preferredLanguage) {
+    outError = preferredError;
     return false;
   }
 
   String fallbackError;
   if (tryLanguage(fallback, fallbackError)) {
+    Serial.println(
+        String("[STT] fallback language ") + preferredLanguage + " -> " + fallback);
     return true;
   }
 
-  outError = fallbackError;
+  outError = clipText(
+      preferredError + " | fallback(" + fallback + "): " + fallbackError,
+      150);
   return false;
 }
 
@@ -1072,19 +1541,6 @@ bool homeAssistantConversation(const String& text, String& outReply, String& out
   }
 
   const String endpoint = joinedUrl(baseUrl.c_str(), "/api/conversation/process");
-  HTTPClient http;
-  WiFiClientSecure secureClient;
-  if (!beginHttp(http, secureClient, endpoint)) {
-    outError = "Conversation HTTP begin failed";
-    return false;
-  }
-
-  http.setReuse(false);
-  http.setConnectTimeout(STT_CONNECT_TIMEOUT_MS);
-  http.setTimeout(STT_IO_TIMEOUT_MS);
-  http.addHeader("Authorization", authHeader);
-  http.addHeader("Content-Type", "application/json");
-
   DynamicJsonDocument req(768);
   req["text"] = text;
   req["language"] = HA_LANGUAGE;
@@ -1098,12 +1554,54 @@ bool homeAssistantConversation(const String& text, String& outReply, String& out
   String body;
   serializeJson(req, body);
 
-  const int code = http.POST(body);
-  const String response = (code >= 200 && code <= 599) ? http.getString() : "";
-  http.end();
+  int code = 0;
+  String response;
+  String transportError;
+  bool requestOk = false;
+  if (endpoint.startsWith("http://")) {
+    requestOk = postJsonOverRawHttp(
+        endpoint,
+        authHeader,
+        body,
+        code,
+        response,
+        transportError);
+    if (!requestOk && transportError.length() > 0) {
+      Serial.println(String("[CONV] raw-http error: ") + transportError);
+    }
+  } else {
+    HTTPClient http;
+    WiFiClient plainClient;
+    WiFiClientSecure secureClient;
+    if (!beginHttp(http, plainClient, secureClient, endpoint)) {
+      outError = "Conversation HTTP begin failed";
+      return false;
+    }
+
+    http.setReuse(false);
+    http.setConnectTimeout(STT_CONNECT_TIMEOUT_MS);
+    http.setTimeout(STT_IO_TIMEOUT_MS);
+    http.addHeader("Authorization", authHeader);
+    http.addHeader("Content-Type", "application/json");
+
+    code = http.POST(body);
+    response = (code >= 200 && code <= 599) ? http.getString() : "";
+    requestOk = true;
+    http.end();
+  }
+  if (!requestOk && code == 0) {
+    code = HTTPC_ERROR_NOT_CONNECTED;
+  }
 
   if (code < 200 || code > 299) {
     outError = String("Conversation HTTP ") + code;
+    const String codeText = sttHttpErrorText(code);
+    if (codeText.length() > 0) {
+      outError += ": " + codeText;
+    }
+    if (!requestOk && transportError.length() > 0) {
+      outError += ": " + clipText(transportError, 64);
+    }
     if (code == 401 || code == 403) {
       invalidateHaAuthProbeCache();
     }
@@ -1185,19 +1683,6 @@ bool homeAssistantTtsGetUrl(const String& text, String& outUrl, String& outError
   const String preferredLang = ttsLanguageTag(configuredLang);
 
   const auto fetchUrl = [&](const String& language, bool preferWav, String& attemptError) -> bool {
-    HTTPClient http;
-    WiFiClientSecure secureClient;
-    if (!beginHttp(http, secureClient, endpoint)) {
-      attemptError = "TTS URL begin failed";
-      return false;
-    }
-
-    http.setReuse(false);
-    http.setConnectTimeout(STT_CONNECT_TIMEOUT_MS);
-    http.setTimeout(STT_IO_TIMEOUT_MS);
-    http.addHeader("Authorization", authHeader);
-    http.addHeader("Content-Type", "application/json");
-
     DynamicJsonDocument req(768);
     req["engine_id"] = ttsEngine;
     req["message"] = text;
@@ -1211,12 +1696,54 @@ bool homeAssistantTtsGetUrl(const String& text, String& outUrl, String& outError
     String body;
     serializeJson(req, body);
 
-    const int code = http.POST(body);
-    const String response = (code >= 200 && code <= 599) ? http.getString() : "";
-    http.end();
+    int code = 0;
+    String response;
+    String transportError;
+    bool requestOk = false;
+    if (endpoint.startsWith("http://")) {
+      requestOk = postJsonOverRawHttp(
+          endpoint,
+          authHeader,
+          body,
+          code,
+          response,
+          transportError);
+      if (!requestOk && transportError.length() > 0) {
+        Serial.println(String("[TTS] raw-http error: ") + transportError);
+      }
+    } else {
+      HTTPClient http;
+      WiFiClient plainClient;
+      WiFiClientSecure secureClient;
+      if (!beginHttp(http, plainClient, secureClient, endpoint)) {
+        attemptError = "TTS URL begin failed";
+        return false;
+      }
+
+      http.setReuse(false);
+      http.setConnectTimeout(STT_CONNECT_TIMEOUT_MS);
+      http.setTimeout(STT_IO_TIMEOUT_MS);
+      http.addHeader("Authorization", authHeader);
+      http.addHeader("Content-Type", "application/json");
+
+      code = http.POST(body);
+      response = (code >= 200 && code <= 599) ? http.getString() : "";
+      requestOk = true;
+      http.end();
+    }
+    if (!requestOk && code == 0) {
+      code = HTTPC_ERROR_NOT_CONNECTED;
+    }
 
     if (code < 200 || code > 299) {
       attemptError = String("TTS URL HTTP ") + code;
+      const String codeText = sttHttpErrorText(code);
+      if (codeText.length() > 0) {
+        attemptError += ": " + codeText;
+      }
+      if (!requestOk && transportError.length() > 0) {
+        attemptError += ": " + clipText(transportError, 64);
+      }
       if (code == 401 || code == 403) {
         invalidateHaAuthProbeCache();
       }
@@ -1285,8 +1812,9 @@ bool homeAssistantPlayTtsWav(const String& ttsUrl, String& outError) {
   }
 
   HTTPClient http;
+  WiFiClient plainClient;
   WiFiClientSecure secureClient;
-  if (!beginHttp(http, secureClient, resolved)) {
+  if (!beginHttp(http, plainClient, secureClient, resolved)) {
     outError = "TTS WAV begin failed";
     return false;
   }
@@ -1881,10 +2409,21 @@ void runAssistantCycle(CaptureRequestSource triggerSource) {
   setState(AssistantState::Transcribing, "Sending to STT");
   drawScreen(true);
 
+  size_t sttSampleCount = captureResult.sampleCount;
+  const size_t sttMaxSamples =
+      static_cast<size_t>(CAPTURE_SAMPLE_RATE) * static_cast<size_t>(ASSISTANT_STT_UPLOAD_MAX_SECONDS);
+  if (sttMaxSamples > 0 && sttSampleCount > sttMaxSamples) {
+    Serial.println(
+        String("[STT] trimming samples ") + sttSampleCount +
+        " -> " + sttMaxSamples +
+        " (" + String(sttMaxSamples / static_cast<float>(CAPTURE_SAMPLE_RATE), 1) + "s)");
+    sttSampleCount = sttMaxSamples;
+  }
+
   String transcript;
   String sttErr;
-  if (!homeAssistantStt(captureBuffer, captureResult.sampleCount, transcript, sttErr)) {
-    setState(AssistantState::Error, "STT failed: " + clipText(sttErr, 54));
+  if (!homeAssistantStt(captureBuffer, sttSampleCount, transcript, sttErr)) {
+    setState(AssistantState::Error, "STT failed: " + sttErr);
     return;
   }
 
@@ -1941,6 +2480,11 @@ void setup() {
   tft.begin();
   tft.setRotation(0);
   tft.fillScreen(TFT_BLACK);
+  uiSprite.setColorDepth(16);
+  uiSpriteReady = uiSprite.createSprite(SCREEN_WIDTH, SCREEN_HEIGHT) != nullptr;
+  if (!uiSpriteReady) {
+    Serial.println("[UI] Sprite allocate failed; using direct TFT rendering");
+  }
 
   loadWifiConfig();
   reconnectSsid = configuredSsid;
